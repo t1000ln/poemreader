@@ -10,8 +10,9 @@ use std::rc::Rc;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar, scroll::ScrollbarMode};
 use gpui_kit::*;
 
+use crate::loader::{DocumentKind, LoadedContent, load_document};
 use crate::settings::{ReadingBackground, Store};
-use crate::{DocumentKind, LoadedContent, PoemReader, file_name_of, load_document};
+use crate::{PoemReader, file_name_of};
 
 #[cfg(windows)]
 #[link(name = "user32")]

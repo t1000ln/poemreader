@@ -140,6 +140,46 @@ dist/
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\generate-icon.ps1
 ```
 
+## 项目结构
+
+按「界面 / 解析 / 输出」三部分划分：解析层不依赖界面，渲染与打印都只消费解析
+结果，彼此之间没有调用关系。
+
+```
+src/
+  main.rs         入口、文档模型（Document）、阅读视图与渲染编排
+  window.rs       进程级 DPI 适配、窗口尺寸与位置、启动时打开哪个文件
+  events.rs       阅读区事件：拖拽平移 / 划选、右键菜单、拖放打开
+  shortcuts.rs    窗口级快捷键：Ctrl+C 复制、Ctrl+P 打印
+  loader.rs       按文件魔数分派解析器，产出 DocumentKind + 内容
+
+  render/         渲染层：只做排版与绘制
+    mod.rs        可划选行的共用模型（SelectableLine / LinePlace / LineText）
+    word.rs       Word 段落、表格与内嵌图片的排版
+    excel.rs      工作表网格、单元格与合并单元格
+    pdf.rs        页面布局与后台栅格化
+
+  text.rs         纯文本折行（按字号与宽度缓存）
+  word.rs         .docx 解析
+  excel.rs        .xlsx 解析
+  doc.rs          .doc 解析（Word 97-2003）
+  xls.rs          .xls 解析（BIFF8）
+  markdown.rs     Markdown 解析
+  ooxml.rs        ZIP 与 XML 公共件（Word / Excel 共用）
+  cfb.rs          OLE2 复合文档（.doc / .xls 的容器）
+  pdf.rs          PDF 解析
+  picture.rs      图片解码（含 SVG、GIF 动画）
+  settings.rs     配置读写（字号、配色、阅读位置）
+
+  print.rs        打印入口，文本与 PDF 的输出
+  print_office.rs Word / Excel / Markdown 的打印排版
+```
+
+视图状态集中在 `PoemReader` 里，由 `main.rs` 定义。`events` 与 `render` 直接
+读写其中的字段（`pub(crate)`），解析器与加载器则完全不知道界面的存在。
+注意 `src/pdf.rs` 与 `src/render/pdf.rs` 分工不同：前者解析 PDF，后者只管
+页面落在哪儿、什么时候栅格化。
+
 ## 说明
 
 - 依赖 `gpui-kit = "0.9.1"`；PDF 由 `hayro` 栅格化（纯 Rust，无系统依赖、无需 DLL）。
