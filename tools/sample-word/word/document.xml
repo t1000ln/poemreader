@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+  xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Title"/></w:pPr>
+      <w:r><w:t>PoemReader Word 示例文档</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Quote"/></w:pPr>
+      <w:r><w:t>这个文档用来检查段落样式、字体、列表、表格与图片是否按原样呈现。</w:t></w:r>
+    </w:p>
+
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>一、文字样式</w:t></w:r></w:p>
+    <w:p>
+      <w:r><w:t xml:space="preserve">普通文字，接着是</w:t></w:r>
+      <w:r><w:rPr><w:b/></w:rPr><w:t>加粗</w:t></w:r>
+      <w:r><w:t xml:space="preserve">、</w:t></w:r>
+      <w:r><w:rPr><w:i/></w:rPr><w:t>斜体</w:t></w:r>
+      <w:r><w:t xml:space="preserve">、</w:t></w:r>
+      <w:r><w:rPr><w:u w:val="single"/></w:rPr><w:t>下划线</w:t></w:r>
+      <w:r><w:t xml:space="preserve">、</w:t></w:r>
+      <w:r><w:rPr><w:strike/></w:rPr><w:t>删除线</w:t></w:r>
+      <w:r><w:t xml:space="preserve">、</w:t></w:r>
+      <w:r><w:rPr><w:color w:val="C00000"/></w:rPr><w:t>红色文字</w:t></w:r>
+      <w:r><w:t xml:space="preserve">、</w:t></w:r>
+      <w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>高亮文字</w:t></w:r>
+      <w:r><w:t>。</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:ind w:firstLine="420"/></w:pPr>
+      <w:r><w:t>这一段设置了首行缩进两字符。中文段落通常不空行，而是让第一行缩进两个汉字，阅读时更容易分辨段落边界。为了验证自动折行，这一段的文字刻意写得长一些，让它在页面的宽度内自然折成多行。</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:jc w:val="center"/></w:pPr>
+      <w:r><w:rPr><w:sz w:val="28"/><w:b/></w:rPr><w:t>居中的一行加粗大字</w:t></w:r>
+    </w:p>
+
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>二、列表</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>项目符号一</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>项目符号二</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t>编号列表第一项</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t>编号列表第二项</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t>编号列表第三项</w:t></w:r></w:p>
+
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>三、表格</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="4" w:color="BFBFBF"/>
+          <w:left w:val="single" w:sz="4" w:color="BFBFBF"/>
+          <w:bottom w:val="single" w:sz="4" w:color="BFBFBF"/>
+          <w:right w:val="single" w:sz="4" w:color="BFBFBF"/>
+          <w:insideH w:val="single" w:sz="4" w:color="BFBFBF"/>
+          <w:insideV w:val="single" w:sz="4" w:color="BFBFBF"/>
+        </w:tblBorders>
+      </w:tblPr>
+      <w:tblGrid>
+        <w:gridCol w:w="2200"/>
+        <w:gridCol w:w="1800"/>
+        <w:gridCol w:w="2600"/>
+      </w:tblGrid>
+      <w:tr>
+        <w:trPr><w:tblHeader/></w:trPr>
+        <w:tc>
+          <w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>格式</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>说明</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>示例</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>纯文本</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>UTF-8 / GB18030</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>sample.txt</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>PDF</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>按页栅格化显示</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>sample.pdf</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:gridSpan w:val="2"/></w:tcPr>
+          <w:p><w:r><w:t>合并两个单元格</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>Word / Excel</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>四、图片</w:t></w:r></w:p>
+    <w:p><w:pPr><w:jc w:val="center"/></w:pPr>
+      <w:r>
+        <w:drawing>
+          <wp:inline>
+            <wp:extent cx="3048000" cy="2032000"/>
+            <a:graphic>
+              <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                <pic:pic>
+                  <pic:blipFill>
+                    <a:blip r:embed="rIdImage"/>
+                  </pic:blipFill>
+                </pic:pic>
+              </a:graphicData>
+            </a:graphic>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>
+    <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:sz w:val="18"/><w:color w:val="7F7F7F"/></w:rPr><w:t>图 1：内嵌的 PNG 图片</w:t></w:r></w:p>
+
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="851" w:footer="992"/>
+    </w:sectPr>
+  </w:body>
+</w:document>

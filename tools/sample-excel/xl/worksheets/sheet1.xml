@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetFormatPr defaultRowHeight="15" defaultColWidth="9.14"/>
+  <cols>
+    <col min="1" max="1" width="13" customWidth="1"/>
+    <col min="2" max="2" width="16" customWidth="1"/>
+    <col min="3" max="3" width="9" customWidth="1"/>
+    <col min="4" max="4" width="13" customWidth="1"/>
+    <col min="5" max="5" width="15" customWidth="1"/>
+    <col min="6" max="6" width="10" customWidth="1"/>
+    <col min="7" max="7" width="34" customWidth="1"/>
+  </cols>
+  <sheetData>
+    <row r="1" ht="34" customHeight="1">
+      <c r="A1" s="2" t="s"><v>0</v></c>
+    </row>
+    <row r="2" ht="22" customHeight="1">
+      <c r="A2" s="1" t="s"><v>1</v></c>
+      <c r="B2" s="1" t="s"><v>2</v></c>
+      <c r="C2" s="1" t="s"><v>3</v></c>
+      <c r="D2" s="1" t="s"><v>4</v></c>
+      <c r="E2" s="1" t="s"><v>5</v></c>
+      <c r="F2" s="1" t="s"><v>6</v></c>
+      <c r="G2" s="1" t="s"><v>7</v></c>
+    </row>
+    <row r="3" ht="21" customHeight="1">
+      <c r="A3" s="6"><v>45296</v></c>
+      <c r="B3" s="7" t="s"><v>8</v></c>
+      <c r="C3" s="9"><v>12</v></c>
+      <c r="D3" s="4"><v>299</v></c>
+      <c r="E3" s="4"><v>3588</v></c>
+      <c r="F3" s="5"><v>0.1816</v></c>
+    </row>
+    <row r="4" ht="21" customHeight="1">
+      <c r="A4" s="6"><v>45303</v></c>
+      <c r="B4" s="7" t="s"><v>9</v></c>
+      <c r="C4" s="9"><v>5</v></c>
+      <c r="D4" s="4"><v>1299</v></c>
+      <c r="E4" s="4"><v>6495</v></c>
+      <c r="F4" s="5"><v>0.3286</v></c>
+    </row>
+    <row r="5" ht="21" customHeight="1">
+      <c r="A5" s="6"><v>45325</v></c>
+      <c r="B5" s="7" t="s"><v>11</v></c>
+      <c r="C5" s="9"><v>40</v></c>
+      <c r="D5" s="4"><v>89</v></c>
+      <c r="E5" s="4"><v>3560</v></c>
+      <c r="F5" s="5"><v>0.1801</v></c>
+    </row>
+    <row r="6" ht="21" customHeight="1">
+      <c r="A6" s="6"><v>45340</v></c>
+      <c r="B6" s="7" t="s"><v>12</v></c>
+      <c r="C6" s="9"><v>15</v></c>
+      <c r="D6" s="4"><v>159</v></c>
+      <c r="E6" s="4"><v>2385</v></c>
+      <c r="F6" s="5"><v>0.1207</v></c>
+    </row>
+    <row r="7" ht="21" customHeight="1">
+      <c r="A7" s="6"><v>45358</v></c>
+      <c r="B7" s="7" t="s"><v>13</v></c>
+      <c r="C7" s="9"><v>22</v></c>
+      <c r="D7" s="4"><v>129</v></c>
+      <c r="E7" s="4"><v>2838</v></c>
+      <c r="F7" s="5"><v>0.1436</v></c>
+    </row>
+    <row r="8" ht="52" customHeight="1">
+      <c r="A8" s="6"><v>45372</v></c>
+      <c r="B8" s="7" t="s"><v>8</v></c>
+      <c r="C8" s="9"><v>3</v></c>
+      <c r="D8" s="4"><v>299</v></c>
+      <c r="E8" s="4"><v>897</v></c>
+      <c r="F8" s="5"><v>0.0454</v></c>
+      <c r="G8" s="7" t="s"><v>10</v></c>
+    </row>
+    <row r="9" ht="24" customHeight="1">
+      <c r="A9" s="1" t="s"><v>14</v></c>
+      <c r="C9" s="1"><v>97</v></c>
+      <c r="E9" s="8"><v>19763</v></c>
+    </row>
+    <row r="11" ht="40" customHeight="1">
+      <c r="A11" s="7" t="s"><v>21</v></c>
+    </row>
+  </sheetData>
+  <mergeCells count="3">
+    <mergeCell ref="A1:G1"/>
+    <mergeCell ref="A9:B9"/>
+    <mergeCell ref="A11:G11"/>
+  </mergeCells>
+</worksheet>

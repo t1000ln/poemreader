@@ -1,0 +1,26 @@
+1 ICON "assets/icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS 0x40004L
+FILETYPE 0x1L
+{
+  BLOCK "StringFileInfo"
+  {
+    BLOCK "040904B0"
+    {
+      VALUE "CompanyName", "PoemReader"
+      VALUE "FileDescription", "PoemReader - a minimal text reader"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "InternalName", "poemreader"
+      VALUE "OriginalFilename", "PoemReader.exe"
+      VALUE "ProductName", "PoemReader"
+      VALUE "ProductVersion", "0.1.0"
+    }
+  }
+  BLOCK "VarFileInfo"
+  {
+    VALUE "Translation", 0x409, 1200
+  }
+}

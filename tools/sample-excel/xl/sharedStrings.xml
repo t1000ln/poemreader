@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="22" uniqueCount="22">
+  <si><t>PoemReader 销售明细（示例数据）</t></si>
+  <si><t>日期</t></si>
+  <si><t>产品</t></si>
+  <si><t>数量</t></si>
+  <si><t>单价</t></si>
+  <si><t>金额</t></si>
+  <si><t>占比</t></si>
+  <si><t>备注</t></si>
+  <si><t>键盘</t></si>
+  <si><t>显示器</t></si>
+  <si><t>这是一段很长的备注文字，用来检查单元格的自动换行是否生效，以及行高是否被撑开。</t></si>
+  <si><t>鼠标</t></si>
+  <si><t>笔记本支架</t></si>
+  <si><t>USB 集线器</t></si>
+  <si><t>合计</t></si>
+  <si><t>分类</t></si>
+  <si><t>金额小计</t></si>
+  <si><t>硬件</t></si>
+  <si><t>配件</t></si>
+  <si><t>平均单价</t></si>
+  <si><t>最高金额</t></si>
+  <si><t>说明：本表由 PoemReader 示例脚本生成，仅用于检查样式显示。</t></si>
+</sst>
