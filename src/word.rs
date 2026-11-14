@@ -62,6 +62,28 @@ pub struct Paragraph {
     pub font: Option<String>,
     pub bold: bool,
     pub italic: bool,
+    /// Border drawn around the paragraph, used by code blocks to stand out
+    /// from the body text.
+    pub border: ParagraphBorder,
+    /// Background fill painted behind the whole paragraph, used by code blocks
+    /// so their box is filled instead of every character.
+    pub fill: Option<u32>,
+}
+
+/// Border around a paragraph, given as the sides it covers so that a block of
+/// consecutive paragraphs can share one outline.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ParagraphBorder {
+    /// Border colour, RGB; no border is drawn when it is missing.
+    pub color: Option<u32>,
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+    /// Corner radius in points. The top corners round when `top` is drawn and
+    /// the bottom corners when `bottom` is drawn, so the lines of one block
+    /// meet at right angles in the middle.
+    pub radius: f32,
 }
 
 impl Paragraph {
@@ -262,6 +284,8 @@ impl Context<'_> {
             bold: run_style.bold.unwrap_or(false),
             italic: run_style.italic.unwrap_or(false),
             runs: Vec::new(),
+            border: ParagraphBorder::default(),
+            fill: None,
         };
 
         if paragraph.marker.is_some() {

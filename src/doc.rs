@@ -7,7 +7,9 @@
 //! membership; images, headers and footnotes are not interpreted.
 
 use crate::cfb::CompoundFile;
-use crate::word::{Align, Block, Paragraph, Run, Table, TableCell, WordDocument, format_counter};
+use crate::word::{
+    Align, Block, Paragraph, ParagraphBorder, Run, Table, TableCell, WordDocument, format_counter,
+};
 use std::collections::HashMap;
 
 /// Text column width of a Word 97 page with 1.25-inch margins, in points.
@@ -965,6 +967,8 @@ fn paragraph(
             font: None,
             bold: false,
             italic: false,
+            border: ParagraphBorder::default(),
+            fill: None,
         },
         terminator,
         para,

@@ -101,7 +101,15 @@ pub fn print_word(
         match block {
             word::Block::Paragraph(paragraph) => {
                 let layout = layout_paragraph(hdc, &mut fonts, paragraph, column_width, scale);
-                draw_layout(hdc, &layout, left, &mut y, column_width, Some(&mut pages))?;
+                draw_layout(
+                    hdc,
+                    &mut brushes,
+                    &layout,
+                    left,
+                    &mut y,
+                    column_width,
+                    Some(&mut pages),
+                )?;
             }
             word::Block::Table(table) => draw_table(
                 hdc,
@@ -506,6 +514,9 @@ struct ParagraphLayout {
     space_before: f32,
     space_after: f32,
     align: word::Align,
+    border: word::ParagraphBorder,
+    /// Background fill behind the paragraph, in RGB.
+    fill: Option<u32>,
 }
 
 impl ParagraphLayout {
@@ -595,6 +606,8 @@ fn layout_paragraph(
         space_before: paragraph.space_before * scale,
         space_after: paragraph.space_after * scale,
         align: paragraph.align,
+        border: paragraph.border,
+        fill: paragraph.fill,
     }
 }
 
@@ -708,6 +721,7 @@ impl Flow<'_> {
 
 fn draw_layout(
     hdc: HDC,
+    brushes: &mut Brushes,
     layout: &ParagraphLayout,
     x: f32,
     y: &mut f32,
@@ -716,7 +730,8 @@ fn draw_layout(
 ) -> Result<(), String> {
     *y += layout.space_before;
 
-    for item in &layout.items {
+    let last_item = layout.items.len().saturating_sub(1);
+    for (index, item) in layout.items.iter().enumerate() {
         let content_width = (width - layout.indent).max(0.0);
         match item {
             Item::Line { line, indent } => {
@@ -725,6 +740,10 @@ fn draw_layout(
                 }
                 let offset = alignment_offset(layout.align, content_width, line.width);
                 let mut cursor = x + layout.indent + indent + offset;
+                let line_top = *y;
+                if let Some(fill) = layout.fill {
+                    fill_rect(hdc, brushes, x, line_top, width, layout.line_height, fill);
+                }
                 for (text, font, color) in &line.segments {
                     if text.is_empty() {
                         continue;
@@ -739,6 +758,17 @@ fn draw_layout(
                     cursor += text_width(hdc, text);
                 }
                 *y += layout.line_height;
+                draw_paragraph_border(
+                    hdc,
+                    brushes,
+                    layout,
+                    index == 0,
+                    index == last_item,
+                    x,
+                    line_top,
+                    width,
+                    layout.line_height,
+                );
             }
             Item::Image {
                 pixels,
@@ -771,6 +801,55 @@ fn alignment_offset(align: word::Align, width: f32, content: f32) -> f32 {
         word::Align::Center => ((width - content) * 0.5).max(0.0),
         word::Align::Right => (width - content).max(0.0),
         _ => 0.0,
+    }
+}
+
+/// Draws the paragraph's outline for one line of a scrollable or printed page.
+/// Consecutive lines only draw the sides, so the block shares one box.
+#[allow(clippy::too_many_arguments)]
+fn draw_paragraph_border(
+    hdc: HDC,
+    brushes: &mut Brushes,
+    layout: &ParagraphLayout,
+    first: bool,
+    last: bool,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) {
+    let border = layout.border;
+    let Some(color) = border.color else {
+        return;
+    };
+    let thickness = 1.0;
+    if border.left {
+        fill_rect(hdc, brushes, x, y, thickness, height, color);
+    }
+    if border.right {
+        fill_rect(
+            hdc,
+            brushes,
+            x + width - thickness,
+            y,
+            thickness,
+            height,
+            color,
+        );
+    }
+    if border.top && first {
+        fill_rect(hdc, brushes, x, y, width, thickness, color);
+    }
+    if border.bottom && last {
+        fill_rect(
+            hdc,
+            brushes,
+            x,
+            y + height - thickness,
+            width,
+            thickness,
+            color,
+        );
     }
 }
 
@@ -860,6 +939,7 @@ fn draw_table(
             for paragraph in &cell.paragraphs {
                 draw_layout(
                     hdc,
+                    brushes,
                     paragraph,
                     cell_x + padding,
                     &mut cell_y,

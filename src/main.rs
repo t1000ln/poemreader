@@ -1,5 +1,5 @@
 // GUI subsystem in every profile: no console window is created, in debug or release.
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ use gpui_kit::*;
 mod cfb;
 mod doc;
 mod excel;
+mod markdown;
 mod ooxml;
 mod pdf;
 mod print;
@@ -62,9 +63,9 @@ const TEXT_MAX_WIDTH: f32 = 880.;
 /// Height of a text row as a multiple of the font size.
 const LINE_HEIGHT_RATIO: f32 = 1.7;
 
-/// PDFs and Office documents are decoded and held in memory as a whole, so
-/// they keep a size cap. Text files are wrapped into rows while being read and
-/// have no size limit.
+/// PDFs, Office documents and Markdown are decoded and held in memory as a
+/// whole, so they keep a size cap. Text files are wrapped into rows while being
+/// read and have no size limit.
 const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// How long the window has to stop resizing before the text is wrapped again.
@@ -210,6 +211,7 @@ enum DocumentKind {
     Pdf,
     Word,
     Excel,
+    Markdown,
 }
 
 /// What a background load produced. Held only long enough to build a
@@ -219,6 +221,7 @@ enum LoadedContent {
     Pdf(Arc<PdfSource>),
     Word(Arc<WordDocument>),
     Excel(Arc<Workbook>),
+    Markdown(Arc<WordDocument>),
 }
 
 /// The body of a loaded document.
@@ -227,6 +230,7 @@ enum DocumentContent {
     Pdf(PdfView),
     Word(Arc<WordDocument>),
     Excel(Arc<Workbook>),
+    Markdown(Arc<WordDocument>),
 }
 
 /// A loaded document.
@@ -258,6 +262,7 @@ impl Document {
             LoadedContent::Pdf(source) => DocumentContent::Pdf(PdfView::new(source)),
             LoadedContent::Word(document) => DocumentContent::Word(document),
             LoadedContent::Excel(workbook) => DocumentContent::Excel(workbook),
+            LoadedContent::Markdown(document) => DocumentContent::Markdown(document),
         };
 
         Self {
@@ -277,6 +282,9 @@ impl Document {
             }
             DocumentContent::Word(document) => {
                 format!("{} · Word · {} 段", self.file_name, document.paragraphs)
+            }
+            DocumentContent::Markdown(document) => {
+                format!("{} · Markdown · {} 段", self.file_name, document.paragraphs)
             }
             DocumentContent::Excel(workbook) => {
                 format!(
@@ -897,6 +905,7 @@ impl PoemReader {
             Some(DocumentContent::Text(_))
                 | Some(DocumentContent::Word(_))
                 | Some(DocumentContent::Excel(_))
+                | Some(DocumentContent::Markdown(_))
         )
     }
 
@@ -1012,7 +1021,9 @@ impl PoemReader {
     fn text_position_at(&self, point: Point<Pixels>) -> Option<TextPos> {
         match self.document.as_ref().map(|document| &document.content) {
             Some(DocumentContent::Text(text)) => self.text_row_at(text, point),
-            Some(DocumentContent::Word(_)) => self.document_line_at(point),
+            Some(DocumentContent::Word(_)) | Some(DocumentContent::Markdown(_)) => {
+                self.document_line_at(point)
+            }
             _ => None,
         }
     }
@@ -1153,7 +1164,9 @@ impl PoemReader {
         }
         match self.document.as_ref().map(|document| &document.content) {
             Some(DocumentContent::Text(text)) => self.rows_text(text, selection),
-            Some(DocumentContent::Word(_)) => self.lines_text(selection),
+            Some(DocumentContent::Word(_)) | Some(DocumentContent::Markdown(_)) => {
+                self.lines_text(selection)
+            }
             _ => None,
         }
     }
@@ -1341,7 +1354,9 @@ impl PoemReader {
                 font_pt: (self.font_size.as_f32() * 72.0 / 96.0).clamp(7.0, 20.0),
             },
             DocumentContent::Pdf(view) => PrintContent::Pdf(view.source()),
-            DocumentContent::Word(word) => PrintContent::Word(word.clone()),
+            DocumentContent::Word(word) | DocumentContent::Markdown(word) => {
+                PrintContent::Word(word.clone())
+            }
             DocumentContent::Excel(workbook) => PrintContent::Excel(workbook.clone()),
         };
 
@@ -1620,9 +1635,10 @@ impl PoemReader {
     fn current_position(&self, window: &Window) -> Option<f32> {
         let document = self.document.as_ref()?;
         Some(match &document.content {
-            DocumentContent::Text(_) | DocumentContent::Word(_) | DocumentContent::Excel(_) => {
-                self.scroll_handle.offset().y.as_f32()
-            }
+            DocumentContent::Text(_)
+            | DocumentContent::Word(_)
+            | DocumentContent::Excel(_)
+            | DocumentContent::Markdown(_) => self.scroll_handle.offset().y.as_f32(),
             DocumentContent::Pdf(view) => self
                 .pdf_layout(view, window)
                 .anchor_for_offset(self.scroll_offset()),
@@ -1816,7 +1832,9 @@ impl PoemReader {
         let kind = self.document.as_ref().map(|document| &document.content);
         match kind {
             Some(DocumentContent::Pdf(_)) => return self.render_pdf_body(window, foreground, cx),
-            Some(DocumentContent::Word(_)) => return self.render_word_body(window, foreground, cx),
+            Some(DocumentContent::Word(_)) | Some(DocumentContent::Markdown(_)) => {
+                return self.render_word_body(window, foreground, cx);
+            }
             Some(DocumentContent::Excel(_)) => {
                 return self.render_excel_body(window, foreground, cx);
             }
@@ -1937,7 +1955,9 @@ impl PoemReader {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let document = match self.document.as_ref().map(|document| &document.content) {
-            Some(DocumentContent::Word(document)) => document.clone(),
+            Some(DocumentContent::Word(document)) | Some(DocumentContent::Markdown(document)) => {
+                document.clone()
+            }
             _ => return empty_body(foreground),
         };
 
@@ -2349,7 +2369,7 @@ fn empty_body(foreground: Hsla) -> AnyElement {
                     div()
                         .text_sm()
                         .opacity(0.65)
-                        .child("使用菜单「文件 → 加载文件…」或把文件拖入窗口，打开文本、PDF、Word 或 Excel 文件"),
+                        .child("使用菜单「文件 → 加载文件…」或把文件拖入窗口，打开文本、Markdown、PDF、Word 或 Excel 文件"),
                 ),
         )
         .into_any_element()
@@ -2613,7 +2633,7 @@ fn word_paragraph(
         blocks.push(div().h(px(line_height)).into_any_element());
     }
 
-    div()
+    let mut element = div()
         .w_full()
         .pl(px(paragraph.indent * scale))
         .pt(px(paragraph.space_before * scale))
@@ -2623,8 +2643,35 @@ fn word_paragraph(
             word::Align::Right => TextAlign::Right,
             _ => TextAlign::Left,
         })
-        .children(blocks)
-        .into_any_element()
+        .children(blocks);
+
+    if let Some(fill) = paragraph.fill {
+        // Painted behind the whole paragraph, so a code block's card reaches
+        // the edges of its outline instead of stopping at each character.
+        element = element.bg(rgb(fill));
+    }
+
+    if let Some(color) = paragraph.border.color {
+        let border = paragraph.border;
+        let radius = px(border.radius * scale);
+        element = element.border_color(rgb(color));
+        // Only the top and bottom lines own the rounded corners, so the lines
+        // of one code block meet at right angles in between.
+        if border.top {
+            element = element.border_t_1().rounded_tl(radius).rounded_tr(radius);
+        }
+        if border.bottom {
+            element = element.border_b_1().rounded_bl(radius).rounded_br(radius);
+        }
+        if border.left {
+            element = element.border_l_1();
+        }
+        if border.right {
+            element = element.border_r_1();
+        }
+    }
+
+    element.into_any_element()
 }
 
 fn push_text_run(
@@ -3100,17 +3147,18 @@ fn show_about(window: &mut Window, cx: &mut App) {
                     .child("· 支持纯文本（UTF-8 / GB18030）")
                     .child("· 纯文本按需排版，可打开任意大小的文件")
                     .child("· 支持 PDF：按页完整渲染字体、表格与图片")
+                    .child("· 支持 Markdown（.md）：标题、强调、列表、表格、代码块、引用与图片")
                     .child("· 支持 Word（.docx）：段落样式、字符格式、列表、表格与图片")
                     .child("· 支持 Excel（.xlsx）：单元格字体、颜色、边框、数字格式与多工作表")
                     .child("· 「文件 → 加载文件…」打开本地文件")
                     .child("· 也可以把文件从系统拖入窗口直接打开")
-                    .child("· 纯文本按行渲染，PDF 按页渲染，Word / Excel 按自身排版绘制")
+                    .child("· 纯文本按行渲染，Markdown / Word / Excel 按自身排版绘制，PDF 按页渲染")
                     .child("· 所有文档都支持滚轮与鼠标拖拽平移")
                     .child("· 纯文本可用右键菜单切换「拖拽平移 / 划选文字」")
                     .child("· 划选后用 Ctrl+C 或右键菜单「复制所选文字」复制")
-                    .child("· 「文件 → 打印…」或 Ctrl+P 打印文本、PDF、Word 与 Excel")
+                    .child("· 「文件 → 打印…」或 Ctrl+P 打印文本、Markdown、PDF、Word 与 Excel")
                     .child("· 打印对话框中可选「页码」只打印指定页或页码范围")
-                    .child("· 「字体大小」调整正文；PDF / Word / Excel 为「页面缩放」")
+                    .child("· 「字体大小」调整纯文本；Markdown / PDF / Word / Excel 为「页面缩放」")
                     .child("· 「窗口背景色」切换阅读配色")
                     .child("· 字号、缩放、配色和阅读位置会自动保存，下次启动时恢复"),
             )
@@ -3123,12 +3171,22 @@ fn show_about(window: &mut Window, cx: &mut App) {
     });
 }
 
-/// Load a text, PDF, Word or Excel document from disk.
+/// Load a text, PDF, Word, Excel or Markdown document from disk.
 fn load_document(path: &Path) -> Result<(DocumentKind, LoadedContent), String> {
     let bytes = read_file_bytes(path)?;
     if is_pdf(path, &bytes) {
         return PdfSource::load(bytes)
             .map(|source| (DocumentKind::Pdf, LoadedContent::Pdf(Arc::new(source))));
+    }
+    if is_markdown_path(path) {
+        let text = decode_text(bytes);
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        return markdown::load(&text, base).map(|document| {
+            (
+                DocumentKind::Markdown,
+                LoadedContent::Markdown(Arc::new(document)),
+            )
+        });
     }
     if bytes.starts_with(b"PK\x03\x04") {
         return load_office(bytes);
@@ -3160,7 +3218,9 @@ fn load_office(bytes: Vec<u8>) -> Result<(DocumentKind, LoadedContent), String> 
 
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("无法读取文件信息：{error}"))?;
-    if (is_pdf_path(path) || is_office_path(path)) && metadata.len() > MAX_DOCUMENT_BYTES {
+    if (is_pdf_path(path) || is_office_path(path) || is_markdown_path(path))
+        && metadata.len() > MAX_DOCUMENT_BYTES
+    {
         return Err(format!(
             "文件过大（{:.1} MB），最大支持 {} MB",
             metadata.len() as f64 / (1024.0 * 1024.0),
@@ -3180,6 +3240,10 @@ fn is_office_path(path: &Path) -> bool {
         path,
         &["docx", "xlsx", "docm", "xlsm", "dotx", "xltx", "doc", "xls"],
     )
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    has_extension(path, &["md", "markdown", "mdown", "mkd", "mkdn"])
 }
 
 /// Legacy Word and Excel documents share the OLE2 container; which one it is

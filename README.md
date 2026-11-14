@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 自绘标题栏 + 菜单栏：`文件`（加载文件… / 打印… / 退出）、`字体大小`（PDF / Word / Excel 为 `页面缩放`）、`窗口背景色`、`关于`
+- 自绘标题栏 + 菜单栏：`文件`（加载文件… / 打印… / 退出）、`字体大小`（Markdown / PDF / Word / Excel 为 `页面缩放`）、`窗口背景色`、`关于`
 - `文件 → 加载文件…` 调用系统原生文件对话框选择文件
 - 也可以把文件从系统（如资源管理器）拖入窗口直接打开
 - 支持纯文本（UTF-8 含 BOM / GB18030），不限大小
@@ -17,6 +17,14 @@
   - 页面在后台线程逐页渲染，只渲染视口附近的页面，打开大文件不必等待
   - 缩放 75% / 100% / 125% / 150% / 200%，超过 100% 时可用底部滚动条左右查看
   - 加密 / 需要密码的 PDF 暂不支持
+- 支持 Markdown（`.md` / `.markdown`）：按文档结构排版，不显示 Markdown 标记
+  - 标题层级、段落、加粗 / 斜体 / 删除线、行内代码
+  - 有序 / 无序 / 任务列表（多级缩进）、引用、分隔线、脚注
+  - GFM 表格：表头底色、按列对齐、边框
+  - 围栏代码块：等宽字体、浅色底纹与圆角外边框，保留缩进与空行
+  - 本地相对路径图片按原比例显示，并限制在正文宽度内；远程图片显示替代文字
+  - 链接显示为带下划线的文字，复制时只复制文字
+  - 与 Word 一样支持页面缩放、划选复制与打印
 - 支持 Word（`.docx`）：按文档自身的排版模型绘制，保留段落样式
   - 段落：标题样式、对齐方式、缩进（含首行缩进）、段前段后间距、行距
   - 字符：加粗、斜体、下划线、删除线、字号、字体、文字颜色、高亮
@@ -40,10 +48,10 @@
 - 鼠标左键有两种模式，通过右键菜单切换：
   - `拖拽平移`：按住左键拖动即可上下左右移动内容（手形光标）
   - `划选文字`：按住左键拖动即可选中文字（I 形光标），支持跨行、跨换行与自动折行
-    - 纯文本按字符选中，Word（`.docx` 与旧版 `.doc`）按段落文字选中，
+    - 纯文本按字符选中，Markdown、Word（`.docx` 与旧版 `.doc`）按段落文字选中，
       Excel（`.xlsx` 与旧版 `.xls`）按单元格矩形选中
 - 复制所选文字：`Ctrl+C`，或右键菜单中的「复制所选文字」
-  - Word 复制段落文本，同段内不额外换行；Excel 复制为制表符分隔的表格文本
+  - Markdown / Word 复制段落文本，同段内不额外换行；Excel 复制为制表符分隔的表格文本
 - 打印：`文件 → 打印…` 或 `Ctrl+P`，使用系统打印对话框选择打印机、份数与页码
   - 所有格式都支持页码范围，可在对话框中选「页码」并输入单页或范围（如 `3`、`5-12`）
     - PDF 的对话框按文件真实页数限制可选范围
@@ -54,6 +62,7 @@
   - 打印不会改变阅读位置与当前选区
   - Word 按文档自身的页面宽度排版：字体、颜色、列表、表格与内嵌图片都会输出，
     超出页面宽度时整体缩小以适应纸张
+  - Markdown 与 Word 使用同一套排版输出，标题、列表、表格、代码块和图片都会保留
   - Excel 按列 / 行边界分页，每个工作表依次输出，保留填充色、边框与数字格式
 - 模式会随其他设置一起保存，下次启动时沿用
 - 正文字号可调（14–28 px），四种阅读配色（默认 / 米黄 / 淡绿 / 夜间）
@@ -74,6 +83,7 @@ cargo run -- samples/sample.pdf
 cargo run -- samples/sample-rich.pdf
 cargo run -- samples/sample.docx
 cargo run -- samples/sample.xlsx
+cargo run -- samples/sample.md
 ```
 
 首次编译 GPUI 依赖需要几分钟。程序使用 Windows GUI 子系统，
@@ -101,6 +111,8 @@ dist/
     samples/sample-rich.pdf
     samples/sample.docx
     samples/sample.xlsx
+    samples/sample.md
+    samples/sample-image.png
     samples/_legacy-sample.doc
     samples/_legacy.doc
     samples/_legacy.xls
@@ -126,12 +138,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\generate-icon.ps1
 - 依赖 `gpui-kit = "0.9.1"`；PDF 由 `hayro` 栅格化（纯 Rust，无系统依赖、无需 DLL）。
 - Word / Excel 由 `src/word.rs`、`src/excel.rs` 直接读取 OOXML（`src/ooxml.rs` 负责 ZIP 与 XML），
   不依赖 Office 或 LibreOffice，也不需要任何 COM 组件。
+- Markdown 由 `markdown`（markdown-rs）的 GFM 解析器解析，再转换成 Word 的块模型
+  （`src/markdown.rs`），因此显示、划选与打印复用同一套排版代码。
 - 文件对话框由 GPUI 平台层（Windows 上的 `IFileOpenDialog`）提供，不额外依赖第三方对话框库。
-- 打印使用 Windows GDI 实现（`src/print.rs`，Word / Excel 的排版在 `src/print_office.rs`），
+- 打印使用 Windows GDI 实现（`src/print.rs`，Word / Excel / Markdown 的排版在 `src/print_office.rs`），
   其他平台目前会提示暂不支持。
-- PDF 页面是栅格图像，因此划选与复制只适用于纯文本、Word 与 Excel；
+- PDF 页面是栅格图像，因此划选与复制只适用于纯文本、Markdown、Word 与 Excel；
   右键菜单在 PDF 下只提供拖拽平移。
-- 纯文本文件没有大小上限；PDF、Word、Excel 上限 128 MB。
+- 纯文本文件没有大小上限；Markdown、PDF、Word、Excel 上限 128 MB。
+- Markdown 中的图片只读取本地相对路径或绝对路径；网络图片不会被下载，而是显示替代文字。
 - 已经渲染的页面最多缓存 12 页、约 256 MB，超出后按与当前位置的距离淘汰。
 - 单页栅格最大 2400 万像素，超大尺寸页面会自动降低渲染分辨率。
 - `samples/sample.pdf` 由 `tools/generate-sample-pdf.ps1` 生成；
