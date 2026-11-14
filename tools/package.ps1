@@ -1,6 +1,9 @@
 # Builds the release executable and packages it into dist/*.zip.
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version = "0.1.0",
+    # Register the packaged executable as a handler for its file types, so it shows
+    # up in "Open with". Per-user only, see register-associations.ps1.
+    [switch]$Associate
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +45,14 @@ try {
     Copy-Item (Join-Path $Root "THIRD-PARTY-NOTICES.md") $outDir
     Copy-Item -Recurse (Join-Path $Root "samples") $outDir
 
+    # Ship the installer and the association helper next to the exe. install.cmd
+    # copies the folder into %LOCALAPPDATA% and registers the installed copy, so
+    # users never have to type a path.
+    Copy-Item (Join-Path $Root "tools\install.ps1") $outDir
+    Copy-Item (Join-Path $Root "tools\install.cmd") $outDir
+    Copy-Item (Join-Path $Root "tools\register-associations.ps1") $outDir
+    Copy-Item (Join-Path $Root "tools\register-associations.cmd") $outDir
+
     # Compress-Archive can fail on large inputs, so use the .NET zip API.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -57,6 +68,14 @@ try {
     Write-Host "Release: $outDir"
     Write-Host "Archive: $zip"
     Write-Host "Executable: $exeSize MB, archive: $zipSize MB"
+
+    if ($Associate) {
+        # Run the copy that was packed, with no -ExePath: the script resolves the exe
+        # from its own folder, which is exactly the path a user would end up with
+        # after unpacking. It fails on a machine where the folder later moves, which
+        # is the documented behaviour of an absolute path in the registry.
+        & (Join-Path $outDir "register-associations.ps1")
+    }
 }
 finally {
     Pop-Location

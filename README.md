@@ -100,6 +100,9 @@ cargo run -- samples/sample-image.png
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\package.ps1
+
+# 打包后顺手把 dist 里的副本注册为文件打开候选（见「文件关联」）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\package.ps1 -Associate
 ```
 
 脚本会执行 `cargo build --release`，验证 exe 使用 GUI 子系统（无控制台窗口），
@@ -113,6 +116,10 @@ dist/
     LICENSE-MIT
     LICENSE-APACHE
     THIRD-PARTY-NOTICES.md
+    install.cmd
+    install.ps1
+    register-associations.cmd
+    register-associations.ps1
     samples/sample.txt
     samples/sample.pdf
     samples/sample-rich.pdf
@@ -128,6 +135,69 @@ dist/
 
 发布版 exe 已内嵌图标与版本信息（ProductName / FileVersion 等）。
 目标机器需要已安装 Microsoft Visual C++ 运行库（绝大多数 Windows 10/11 自带）。
+
+## 安装
+
+发布包里带一个免管理员的安装脚本。解压后**双击 `install.cmd`** 即可，它会：
+
+- 把程序复制到 `%LOCALAPPDATA%\Programs\PoemReader`，装完可以删掉解压出来的文件夹
+- 建立开始菜单快捷方式
+- 在「设置 → 应用 → 已安装的应用」里登记，可以从那里卸载
+- 把**安装后的副本**注册为支持格式的「打开方式」候选（见下一节）
+
+也可以在 PowerShell 里带参数运行：
+
+```powershell
+# 指定安装目录
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -InstallDir "D:\Apps\PoemReader"
+
+# 只装程序，不注册文件关联、不建快捷方式
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -NoAssociations -NoShortcuts
+
+# 卸载（同时移除文件关联、快捷方式与注册表项）
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+```
+
+写入范围只有 `HKCU` 和用户自己的目录，不需要管理员权限，也不影响本机其他账户。
+卸载时会删除安装目录，因此**装到别的目录后不要往里面放自己的文件**。
+
+## 文件关联
+
+让 PoemReader 出现在「打开方式」里，可以自己选它来打开支持的格式。
+
+安装时这一步默认已经完成——`install.ps1` 会调用下面这个脚本。如果不想安装、
+想直接就地使用解压出来的副本，也可以单独运行它。发布包里自带注册脚本，就在
+exe 旁边，解压到任意目录后：
+
+- **双击 `register-associations.cmd`** 即可注册，结束后按任意键关闭窗口
+- 取消注册：在同一目录执行 `register-associations.cmd -Unregister`
+
+也可以用 PowerShell 直接运行脚本，效果相同：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\register-associations.ps1
+
+# 取消注册
+powershell -NoProfile -ExecutionPolicy Bypass -File .\register-associations.ps1 -Unregister
+```
+
+脚本按**自身所在目录**查找 `PoemReader.exe`，与你从哪个目录启动无关，所以文件夹解压到哪里都能直接用。注册表里记录的仍是那个 exe 的绝对路径，**移动文件夹后需要重新运行一次**。
+
+在源码仓库里直接运行 `tools\register-associations.ps1` 时，同目录没有 exe，会依次回退到 `target\release` 和 `dist\`；也可以显式指定：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-associations.ps1 -ExePath "C:\Apps\PoemReader\PoemReader.exe"
+```
+
+- 覆盖全部支持的格式：纯文本、PDF、Word（`.docx` / `.docm` / `.dotx` / `.doc`）、
+  Excel（`.xlsx` / `.xlsm` / `.xltx` / `.xls`）、Markdown、图片
+- 只写 `HKCU`，不需要管理员权限，也不影响本机其他账户
+- 不写 `UserChoice`（Windows 8 起有哈希保护，写了会被系统判为篡改并重置），
+  也不改扩展名的默认值，因此不会和已有关联打架；取消注册时只删自己写入的值
+- 注册后 PoemReader 会出现在「打开方式」和「设置 → 应用 → 默认应用」中。
+  **把某个格式真正设为默认需要用户自己勾一次「始终使用此应用」**，
+  这是 Windows 的规定，程序无法代替
+- 注册表里记录的是 exe 的绝对路径，换了目录要重新运行脚本
 
 ## 图标
 
