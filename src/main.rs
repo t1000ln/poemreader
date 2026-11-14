@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Theme, ThemeMode, TitleBar, WindowExt as _,
+    ActiveTheme as _, IconName, TitleBar, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
-    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
+    menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     scroll::{Scrollbar, ScrollbarMode},
     v_flex,
@@ -22,6 +22,7 @@ use gpui_kit::*;
 
 mod cfb;
 mod doc;
+mod events;
 mod excel;
 mod markdown;
 mod ooxml;
@@ -31,10 +32,13 @@ mod print;
 #[cfg(windows)]
 mod print_office;
 mod settings;
+mod shortcuts;
 mod text;
+mod window;
 mod word;
 mod xls;
 
+use events::{CellSelection, Interaction, Selection};
 use excel::Workbook;
 use ooxml::Package;
 use pdf::{PdfSource, PdfView};
@@ -92,136 +96,18 @@ const SAVE_POSITION_DEBOUNCE: Duration = Duration::from_millis(250);
 /// The app icon, also embedded in the executable by `build.rs`.
 const APP_ICON: &[u8] = include_bytes!("../assets/icon.svg");
 
-#[cfg(windows)]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
-    fn GetDpiForSystem() -> u32;
-}
-
-/// The window manifest embedded by GPUI already selects PerMonitorV2; this is
-/// a fallback for builds where that manifest is missing, and it fails
-/// harmlessly when the awareness was already set.
-fn enable_dpi_awareness() {
-    #[cfg(windows)]
-    unsafe {
-        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        let _ = SetProcessDpiAwarenessContext(-4);
-    }
-}
-
-fn system_scale_factor() -> f32 {
-    unsafe { GetDpiForSystem() as f32 / 96.0 }
-    #[cfg(not(windows))]
-    {
-        1.0
-    }
-}
-
-/// Center a logical-size window on the primary display.
-///
-/// `Bounds::centered` centres against the display size GPUI reports, which on
-/// Windows is the physical size while window bounds are logical. Dividing by
-/// the real scale factor keeps the window inside the visible work area on
-/// high-DPI displays.
-fn initial_window_bounds(cx: &App) -> Bounds<Pixels> {
-    let window_size = size(px(1120.), px(800.));
-    let Some(display) = cx.primary_display() else {
-        return Bounds::new(point(px(80.), px(80.)), window_size);
-    };
-
-    let scale = system_scale_factor();
-    let visible = display.visible_bounds();
-    let logical_width = visible.size.width.as_f32() / scale;
-    let logical_height = visible.size.height.as_f32() / scale;
-    let origin = point(
-        px(((logical_width - window_size.width.as_f32()) / 2.0).max(0.0)),
-        px(((logical_height - window_size.height.as_f32()) / 2.0).max(0.0)),
-    );
-
-    Bounds::new(origin, window_size)
-}
-
 fn main() {
-    enable_dpi_awareness();
-
-    let store = Rc::new(RefCell::new(Store::load()));
-    let latest_position = Rc::new(Cell::new(None::<f32>));
-    let initial = resolve_initial_document(&store.borrow());
-    let initial_title = match initial.as_ref() {
-        Some((path, _, _)) => format!("PoemReader — {}", file_name_of(path)),
-        None => String::from("PoemReader"),
-    };
-    let initial_background = store.borrow().settings().background;
-
-    application().with_assets(assets::Assets).run(move |cx| {
-        gpui_kit::init(cx);
-        // Keep the reading scrollbar visible instead of fading it out when idle.
-        component::Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
-        apply_theme_mode(initial_background, cx);
-
-        let bounds = initial_window_bounds(cx);
-        let _ = open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(560.), px(420.))),
-                ..TitleBar::window_options()
-            },
-            cx,
-            {
-                let store = store.clone();
-                let latest_position = latest_position.clone();
-                move |window, cx| {
-                    window.set_window_title(&initial_title);
-                    let font = window.text_style().font();
-                    cx.new(move |cx| PoemReader::new(store, latest_position, initial, font, cx))
-                }
-            },
-        )
-        .expect("failed to open the PoemReader window");
-
-        // Closing the window with its close button removes it without running
-        // the app-quit handlers, so persist the latest reading position here
-        // as well. The callback only holds shared state and lives as long as
-        // the application, hence the subscription is intentionally leaked.
-        let close_store = store.clone();
-        let close_position = latest_position.clone();
-        let subscription = cx.on_window_closed(move |_cx, _window_id| {
-            let mut store = close_store.borrow_mut();
-            if let Some(position) = close_position.get()
-                && let Some(path) = store.settings().last_file.clone()
-            {
-                store.set_position(&path, position);
-            }
-            store.save();
-        });
-        std::mem::forget(subscription);
-    });
+    window::run();
 }
 
-/// Prefer the file passed on the command line, then the file read last session.
-/// Prefer the file passed on the command line, then the file read last session.
-fn resolve_initial_document(store: &Store) -> Option<(PathBuf, DocumentKind, LoadedContent)> {
-    if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from)
-        && let Ok((kind, content)) = load_document(&path)
-    {
-        return Some((path, kind, content));
-    }
-
-    let path = store.settings().last_file.clone()?;
-    load_document(&path)
-        .ok()
-        .map(|(kind, content)| (path, kind, content))
-}
-
-fn file_name_of(path: &Path) -> String {
+pub(crate) fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DocumentKind {
+pub(crate) enum DocumentKind {
     Text,
     Pdf,
     Word,
@@ -232,7 +118,7 @@ enum DocumentKind {
 
 /// What a background load produced. Held only long enough to build a
 /// [`Document`] on the render thread.
-enum LoadedContent {
+pub(crate) enum LoadedContent {
     Text(String),
     Pdf(Arc<PdfSource>),
     Word(Arc<WordDocument>),
@@ -242,7 +128,7 @@ enum LoadedContent {
 }
 
 /// The body of a loaded document.
-enum DocumentContent {
+pub(crate) enum DocumentContent {
     Text(TextView),
     Pdf(PdfView),
     Word(Arc<WordDocument>),
@@ -367,18 +253,6 @@ impl ReadingBackground {
     }
 }
 
-/// Switch the component theme so menus, the about dialog and the window
-/// controls stay legible against the chosen reading background.
-fn apply_theme_mode(background: ReadingBackground, cx: &mut App) {
-    let mode = match background {
-        ReadingBackground::Night => ThemeMode::Dark,
-        ReadingBackground::Paper | ReadingBackground::Mint => ThemeMode::Light,
-        // Default follows whatever appearance the system already selected.
-        ReadingBackground::Default => return,
-    };
-    Theme::change(mode, None, cx);
-}
-
 /// Where the pages of a PDF land in the scroll area, in logical pixels.
 struct PdfLayout {
     pages: Vec<Size<f32>>,
@@ -495,69 +369,11 @@ enum PendingScroll {
     Anchor(f32),
 }
 
-/// What the left button is currently doing in the reading area.
-#[derive(Clone, Copy)]
-enum Interaction {
-    /// Dragging the content around.
-    Pan {
-        /// Where the pointer was when the drag started.
-        origin: Point<Pixels>,
-        /// The scroll offset at that moment.
-        offset: Point<Pixels>,
-    },
-    /// Dragging across text to select it.
-    Select,
-    /// Dragging across the cells of a sheet to select them.
-    SelectCells,
-}
-
 /// A position in the text body: a byte offset within one line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct TextPos {
+pub(crate) struct TextPos {
     line: usize,
     byte: usize,
-}
-
-/// The text the reader has selected, from `anchor` to a movable `head`.
-#[derive(Clone, Copy)]
-struct Selection {
-    anchor: TextPos,
-    head: TextPos,
-}
-
-impl Selection {
-    fn ordered(&self) -> (TextPos, TextPos) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.anchor == self.head
-    }
-
-    /// The byte range of this selection within `line`.
-    fn bytes_in_line(&self, line: usize, len: usize) -> Option<Range<usize>> {
-        let (start, end) = self.ordered();
-        if line < start.line || line > end.line {
-            return None;
-        }
-
-        let from = if line == start.line {
-            start.byte.min(len)
-        } else {
-            0
-        };
-        let to = if line == end.line {
-            end.byte.min(len)
-        } else {
-            len
-        };
-
-        (from < to).then_some(from..to)
-    }
 }
 
 /// A line of a Word document that can be selected, with the layout captured
@@ -585,28 +401,6 @@ struct LinePlace {
     row: Option<usize>,
     /// Leading bytes that belong to the layout but not to the paragraph.
     skip: usize,
-}
-
-/// The cells of a sheet the reader has selected.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct CellSelection {
-    anchor: (u32, u32),
-    head: (u32, u32),
-}
-
-impl CellSelection {
-    fn ordered(&self) -> ((u32, u32), (u32, u32)) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-
-    fn contains(&self, row: u32, column: u32) -> bool {
-        let ((top, left), (bottom, right)) = self.ordered();
-        (top..=bottom).contains(&row) && (left..=right).contains(&column)
-    }
 }
 
 /// A rendered line of text that publishes its layout after prepaint, so the
@@ -688,21 +482,25 @@ impl Element for LineText {
     }
 }
 
-struct PoemReader {
+/// 阅读器视图。
+///
+/// 字段对 crate 内可见：交互状态由 `events` 模块直接改写，渲染与加载留在
+/// 本文件，两边共用同一份状态，避免为每个字段再写一对访问器。
+pub(crate) struct PoemReader {
     document: Option<Document>,
     font_size: Pixels,
     pdf_zoom: f32,
     background: ReadingBackground,
     /// What the left button does in the reading area.
-    pointer_mode: PointerMode,
+    pub(crate) pointer_mode: PointerMode,
     /// Sheet of the open Excel workbook being shown.
     excel_sheet: usize,
     /// Currently selected text, kept after the drag ends so it can be copied.
-    selection: Option<Selection>,
+    pub(crate) selection: Option<Selection>,
     /// Lines of a Word document that can be selected, rebuilt on every render.
     document_lines: Vec<SelectableLine>,
     /// Cells of the current sheet that are selected.
-    cell_selection: Option<CellSelection>,
+    pub(crate) cell_selection: Option<CellSelection>,
     /// Bounds of the cells drawn in the last frame, with their sheet
     /// coordinates, shared with the prepaint listener of the sheet.
     cell_bounds: Rc<RefCell<Vec<(u32, u32, Bounds<Pixels>)>>>,
@@ -715,19 +513,19 @@ struct PoemReader {
     rewrap_task: Option<Task<()>>,
     /// Re-wraps the text when the window is resized.
     bounds_subscription: Option<Subscription>,
-    scroll_handle: ScrollHandle,
+    pub(crate) scroll_handle: ScrollHandle,
     /// Scroll position to apply on the next render.
     pending_scroll: Option<PendingScroll>,
     /// Set while the left button is down over the reading area.
-    interaction: Option<Interaction>,
+    pub(crate) interaction: Option<Interaction>,
     /// Latest reading position, readable after the view is gone.
     latest_position: Rc<Cell<Option<f32>>>,
-    store: Rc<RefCell<Store>>,
+    pub(crate) store: Rc<RefCell<Store>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl PoemReader {
-    fn new(
+    pub(crate) fn new(
         store: Rc<RefCell<Store>>,
         latest_position: Rc<Cell<Option<f32>>>,
         initial: Option<(PathBuf, DocumentKind, LoadedContent)>,
@@ -786,35 +584,9 @@ impl PoemReader {
             })
         };
 
-        // Window-wide shortcuts: copy the selection and print. The reading area
-        // is not a focusable text input, so an interceptor is the simplest way
-        // to notice them.
-        let shortcut_subscription = {
-            let view = cx.entity().downgrade();
-            cx.intercept_keystrokes(move |event, window, cx| {
-                let keystroke = &event.keystroke;
-                if !(keystroke.modifiers.control || keystroke.modifiers.platform) {
-                    return;
-                }
-
-                match keystroke.key.as_str() {
-                    "c" => {
-                        if view
-                            .update(cx, |this, cx| this.copy_selection(cx))
-                            .unwrap_or(false)
-                        {
-                            cx.stop_propagation();
-                        }
-                    }
-                    "p" => {
-                        view.update(cx, |this, cx| this.print_document(window, cx))
-                            .ok();
-                        cx.stop_propagation();
-                    }
-                    _ => {}
-                }
-            })
-        };
+        // Window-wide shortcuts (copy, print) live in `shortcuts.rs`; the
+        // returned subscription has to be kept alive by the view.
+        let shortcut_subscription = Self::bind_shortcuts(cx);
 
         Self {
             document,
@@ -841,7 +613,7 @@ impl PoemReader {
         }
     }
 
-    fn persist_settings(&self) {
+    pub(crate) fn persist_settings(&self) {
         self.store.borrow().save();
     }
 
@@ -859,7 +631,7 @@ impl PoemReader {
     }
 
     /// Save the position once scrolling settles, cancelling the previous timer.
-    fn schedule_position_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn schedule_position_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(SAVE_POSITION_DEBOUNCE).await;
             this.update_in(cx, |this, _window, _cx| {
@@ -868,47 +640,6 @@ impl PoemReader {
             })
             .ok();
         }));
-    }
-
-    /// Wire up the reading area: the left button either pans the content or
-    /// selects text, depending on the pointer mode, and the right button opens
-    /// the menu that switches between the two.
-    fn reading_area(&self, element: Stateful<Div>, cx: &mut Context<Self>) -> impl IntoElement {
-        let selecting = self.uses_text_selection();
-        let panning = matches!(self.interaction, Some(Interaction::Pan { .. }));
-        let cursor = if selecting {
-            CursorStyle::IBeam
-        } else if panning {
-            CursorStyle::ClosedHand
-        } else {
-            CursorStyle::OpenHand
-        };
-
-        let element = element
-            .cursor(cursor)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                    this.begin_interaction(event, cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                this.update_interaction(event, cx);
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _event: &MouseUpEvent, window, cx| {
-                    this.end_interaction(window, cx);
-                }),
-            );
-
-        let view = cx.entity();
-        let selectable = self.supports_selection();
-        let pointer_mode = self.pointer_mode;
-        let has_selection = self.has_selection();
-        element.context_menu(move |menu, _window, _cx| {
-            build_reading_menu(menu, view.clone(), selectable, pointer_mode, has_selection)
-        })
     }
 
     fn is_pdf(&self) -> bool {
@@ -925,135 +656,17 @@ impl PoemReader {
         )
     }
 
-    fn is_excel(&self) -> bool {
+    /// Whether the open document is a sheet, which is selected by cell rather
+    /// than by byte offset.
+    pub(crate) fn is_excel(&self) -> bool {
         matches!(
             self.document.as_ref().map(|document| &document.content),
             Some(DocumentContent::Excel(_))
         )
     }
 
-    /// Formats that hold text the reader can drag over; PDF pages and picture
-    /// documents cannot be selected.
-    fn supports_selection(&self) -> bool {
-        matches!(
-            self.document.as_ref().map(|document| &document.content),
-            Some(DocumentContent::Text(_))
-                | Some(DocumentContent::Word(_))
-                | Some(DocumentContent::Excel(_))
-                | Some(DocumentContent::Markdown(_))
-        )
-    }
-
-    fn uses_text_selection(&self) -> bool {
-        self.supports_selection() && self.pointer_mode == PointerMode::Select
-    }
-
-    fn has_selection(&self) -> bool {
-        self.cell_selection.is_some()
-            || self
-                .selection
-                .is_some_and(|selection| !selection.is_empty())
-    }
-
-    fn begin_interaction(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if self.uses_text_selection() {
-            if self.is_excel() {
-                if let Some(cell) = self.cell_at(event.position) {
-                    self.selection = None;
-                    self.cell_selection = Some(CellSelection {
-                        anchor: cell,
-                        head: cell,
-                    });
-                    self.interaction = Some(Interaction::SelectCells);
-                    cx.notify();
-                    return;
-                }
-            } else if let Some(position) = self.text_position_at(event.position) {
-                self.cell_selection = None;
-                self.selection = Some(Selection {
-                    anchor: position,
-                    head: position,
-                });
-                self.interaction = Some(Interaction::Select);
-                cx.notify();
-                return;
-            }
-        }
-
-        // A press anywhere in pan mode drops the previous selection.
-        self.selection = None;
-        self.cell_selection = None;
-        self.interaction = Some(Interaction::Pan {
-            origin: event.position,
-            offset: self.scroll_handle.offset(),
-        });
-        cx.notify();
-    }
-
-    fn update_interaction(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if event.pressed_button != Some(MouseButton::Left) {
-            // The release happened outside the window, or the drag was cancelled.
-            self.interaction = None;
-            return;
-        }
-
-        match self.interaction {
-            Some(Interaction::Pan { origin, offset }) => {
-                // The content follows the pointer instead of the pointer moving
-                // over the content.
-                self.scroll_handle
-                    .set_offset(offset + (event.position - origin));
-                cx.notify();
-            }
-            Some(Interaction::Select) => {
-                let Some(position) = self.text_position_at(event.position) else {
-                    return;
-                };
-                let Some(selection) = self.selection.as_mut() else {
-                    return;
-                };
-                if selection.head != position {
-                    selection.head = position;
-                    cx.notify();
-                }
-            }
-            Some(Interaction::SelectCells) => {
-                let Some(cell) = self.cell_at(event.position) else {
-                    return;
-                };
-                let Some(selection) = self.cell_selection.as_mut() else {
-                    return;
-                };
-                if selection.head != cell {
-                    selection.head = cell;
-                    cx.notify();
-                }
-            }
-            None => {}
-        }
-    }
-
-    fn end_interaction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.interaction.take() {
-            Some(Interaction::Pan { .. }) => self.schedule_position_save(window, cx),
-            Some(Interaction::Select) | Some(Interaction::SelectCells) => cx.notify(),
-            None => {}
-        }
-    }
-
-    fn set_pointer_mode(&mut self, mode: PointerMode, cx: &mut Context<Self>) {
-        if self.pointer_mode == mode {
-            return;
-        }
-        self.pointer_mode = mode;
-        self.store.borrow_mut().settings_mut().pointer_mode = mode;
-        self.persist_settings();
-        self.interaction = None;
-        cx.notify();
-    }
-
     /// Map a pointer position to the line and byte offset under it.
-    fn text_position_at(&self, point: Point<Pixels>) -> Option<TextPos> {
+    pub(crate) fn text_position_at(&self, point: Point<Pixels>) -> Option<TextPos> {
         match self.document.as_ref().map(|document| &document.content) {
             Some(DocumentContent::Text(text)) => self.text_row_at(text, point),
             Some(DocumentContent::Word(_)) | Some(DocumentContent::Markdown(_)) => {
@@ -1160,7 +773,7 @@ impl PoemReader {
     }
 
     /// Map a pointer position to a cell of the open sheet.
-    fn cell_at(&self, point: Point<Pixels>) -> Option<(u32, u32)> {
+    pub(crate) fn cell_at(&self, point: Point<Pixels>) -> Option<(u32, u32)> {
         let cells = self.cell_bounds.borrow();
         if cells.is_empty() {
             return None;
@@ -1326,7 +939,7 @@ impl PoemReader {
     }
 
     /// Copy the selection to the clipboard; false when nothing was selected.
-    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = self.selected_text() else {
             return false;
         };
@@ -1335,7 +948,7 @@ impl PoemReader {
     }
 
     /// Print the open document, showing the system print dialog first.
-    fn print_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn print_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(job) = self.print_job() else {
             window.push_notification(Notification::info("还没有可打印的文件"), cx);
             return;
@@ -1439,25 +1052,8 @@ impl PoemReader {
         .detach();
     }
 
-    /// Open the first file dropped onto the window from outside the
-    /// application. Folders cannot be opened, so they are skipped.
-    fn open_dropped_files(
-        &mut self,
-        paths: &ExternalPaths,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match paths.paths().iter().find(|path| path.is_file()).cloned() {
-            Some(path) => self.open_path(path, window, cx),
-            None => window.push_notification(
-                Notification::error("无法打开拖入的内容：请拖入一个文件"),
-                cx,
-            ),
-        }
-    }
-
     /// Load the document at `path` in the background and show it.
-    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Parsing and rasterizing a PDF can take a moment, so keep it off the
         // UI thread.
         let read_path = path.clone();
@@ -1721,7 +1317,7 @@ impl PoemReader {
         self.background = background;
         self.store.borrow_mut().settings_mut().background = background;
         self.persist_settings();
-        apply_theme_mode(background, cx);
+        window::apply_theme_mode(background, cx);
     }
 
     /// Distance scrolled from the top of the document, in logical pixels.
@@ -3231,60 +2827,6 @@ fn line_runs(
 
 /// The right-click menu of the reading area: switches between panning and
 /// selecting, and copies the selection.
-fn build_reading_menu(
-    menu: PopupMenu,
-    view: Entity<PoemReader>,
-    selectable: bool,
-    pointer_mode: PointerMode,
-    has_selection: bool,
-) -> PopupMenu {
-    let menu = menu.min_w(px(240.));
-
-    if !selectable {
-        // PDF pages and pictures are images, and Word / Excel documents are
-        // laid out from their own model, so only panning makes sense here.
-        return menu
-            .item(
-                PopupMenuItem::new("拖拽平移（此文档不支持划选）")
-                    .checked(true)
-                    .disabled(true),
-            )
-            .separator()
-            .item(PopupMenuItem::new("复制所选文字（Ctrl+C）").disabled(true));
-    }
-
-    let pan = view.clone();
-    let select = view.clone();
-    let copy = view.clone();
-
-    menu.item(
-        PopupMenuItem::new("拖拽平移")
-            .checked(pointer_mode == PointerMode::Pan)
-            .on_click(move |_, _window, cx| {
-                pan.update(cx, |this, cx| this.set_pointer_mode(PointerMode::Pan, cx));
-            }),
-    )
-    .item(
-        PopupMenuItem::new("划选文字")
-            .checked(pointer_mode == PointerMode::Select)
-            .on_click(move |_, _window, cx| {
-                select.update(cx, |this, cx| {
-                    this.set_pointer_mode(PointerMode::Select, cx)
-                });
-            }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new("复制所选文字（Ctrl+C）")
-            .disabled(!has_selection)
-            .on_click(move |_, _window, cx| {
-                copy.update(cx, |this, cx| {
-                    this.copy_selection(cx);
-                });
-            }),
-    )
-}
-
 /// Rasterize one page off the UI thread and put it in the view's cache.
 fn spawn_pdf_render(
     source: Arc<PdfSource>,
@@ -3399,7 +2941,7 @@ fn show_about(window: &mut Window, cx: &mut App) {
 }
 
 /// Load a text, PDF, Word, Excel or Markdown document from disk.
-fn load_document(path: &Path) -> Result<(DocumentKind, LoadedContent), String> {
+pub(crate) fn load_document(path: &Path) -> Result<(DocumentKind, LoadedContent), String> {
     let bytes = read_file_bytes(path)?;
     if is_pdf(path, &bytes) {
         return PdfSource::load(bytes)
