@@ -22,6 +22,7 @@ available at `https://crates.io/crates/<name>/<version>`.
 | `hayro` (normal) | `^0.9` | 0.9.0 | Apache-2.0 OR MIT |
 | `image` (normal) | `^0.25` | 0.25.10 | MIT OR Apache-2.0 |
 | `quick-xml` (normal) | `^0.41` | 0.41.0 | MIT |
+| `resvg` (normal) | `^0.46` | 0.46.0 | Apache-2.0 OR MIT |
 | `serde` (normal) | `^1` | 1.0.229 | MIT OR Apache-2.0 |
 | `serde_json` (normal) | `^1` | 1.0.154 | MIT OR Apache-2.0 |
 | `embed-resource` (build) | `^3` | 3.0.12 | MIT |

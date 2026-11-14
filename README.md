@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 自绘标题栏 + 菜单栏：`文件`（加载文件… / 打印… / 退出）、`字体大小`（Markdown / PDF / Word / Excel 为 `页面缩放`）、`窗口背景色`、`关于`
+- 自绘标题栏 + 菜单栏：`文件`（加载文件… / 打印… / 退出）、`字体大小`（Markdown / PDF / Word / Excel / 图片为 `页面缩放`）、`窗口背景色`、`关于`
 - `文件 → 加载文件…` 调用系统原生文件对话框选择文件
 - 也可以把文件从系统（如资源管理器）拖入窗口直接打开
 - 支持纯文本（UTF-8 含 BOM / GB18030），不限大小
@@ -37,6 +37,11 @@
   - 列宽与行高、合并单元格、多工作表（顶部标签切换）
   - 数字格式：整数、千分位、小数、百分比、货币、日期与时间
   - 只绘制可见区域的单元格，大表滚动仍然流畅
+- 支持图片：JPEG（`.jpg` / `.jpeg` / `.jfif`）、PNG、BMP、WebP、ICO、GIF（含动画）与 SVG（含 `.svgz`）
+  - 打开时按窗口大小等比适配；可用「页面缩放」或鼠标滚轮缩放，以指针所在位置为中心
+  - 超出窗口时用鼠标拖拽或滚动条上下左右查看
+  - SVG 以较高分辨率栅格化，适配到窗口大小后依然清晰；GIF 动图会自动播放
+  - 透明背景的图片显示在当前阅读底色上，打印时自动铺上白色背景
 - 支持旧版 Word（`.doc`，Word 97-2003）与 Excel（`.xls`，Excel 97 / BIFF8）
   - `.doc`：读取正文、直接字符格式（加粗 / 斜体 / 下划线 / 删除线 / 字号 / 颜色 / 高亮）、
     段落对齐与缩进、列表符号与编号、表格边框；命名样式只继承段落对齐与列表归属，其余样式属性、
@@ -59,6 +64,7 @@
       超出实际页数时只打印存在的页面，并提示文档总页数
   - 文本按当前字号排版并自动分页，0.5 英寸页边距，超出部分自动换行
   - PDF 按打印机分辨率逐页栅格化后输出，保持原始比例并居中
+  - 图片按纸张可打印区域等比缩放后居中输出
   - 打印不会改变阅读位置与当前选区
   - Word 按文档自身的页面宽度排版：字体、颜色、列表、表格与内嵌图片都会输出，
     超出页面宽度时整体缩小以适应纸张
@@ -84,6 +90,7 @@ cargo run -- samples/sample-rich.pdf
 cargo run -- samples/sample.docx
 cargo run -- samples/sample.xlsx
 cargo run -- samples/sample.md
+cargo run -- samples/sample-image.png
 ```
 
 首次编译 GPUI 依赖需要几分钟。程序使用 Windows GUI 子系统，
@@ -136,6 +143,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\generate-icon.ps1
 ## 说明
 
 - 依赖 `gpui-kit = "0.9.1"`；PDF 由 `hayro` 栅格化（纯 Rust，无系统依赖、无需 DLL）。
+- 图片由 `image` 解码，SVG 由 `resvg` 解析并按窗口尺寸栅格化为位图（`src/picture.rs`），
+  因此 JPEG、PNG、BMP、WebP、ICO、GIF 与 SVG 都能直接打开。
 - Word / Excel 由 `src/word.rs`、`src/excel.rs` 直接读取 OOXML（`src/ooxml.rs` 负责 ZIP 与 XML），
   不依赖 Office 或 LibreOffice，也不需要任何 COM 组件。
 - Markdown 由 `markdown`（markdown-rs）的 GFM 解析器解析，再转换成 Word 的块模型
@@ -143,9 +152,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\generate-icon.ps1
 - 文件对话框由 GPUI 平台层（Windows 上的 `IFileOpenDialog`）提供，不额外依赖第三方对话框库。
 - 打印使用 Windows GDI 实现（`src/print.rs`，Word / Excel / Markdown 的排版在 `src/print_office.rs`），
   其他平台目前会提示暂不支持。
-- PDF 页面是栅格图像，因此划选与复制只适用于纯文本、Markdown、Word 与 Excel；
-  右键菜单在 PDF 下只提供拖拽平移。
-- 纯文本文件没有大小上限；Markdown、PDF、Word、Excel 上限 128 MB。
+- PDF 页面与图片只支持拖拽平移，不支持划选与复制；
+  右键菜单在这两种文档下只提供拖拽平移。
+- 纯文本文件没有大小上限；Markdown、PDF、Word、Excel 与图片上限 128 MB。
+- 单边超过 8192 像素的图片会在载入时缩小，避免超大照片耗尽内存。
 - Markdown 中的图片只读取本地相对路径或绝对路径；网络图片不会被下载，而是显示替代文字。
 - 已经渲染的页面最多缓存 12 页、约 256 MB，超出后按与当前位置的距离淘汰。
 - 单页栅格最大 2400 万像素，超大尺寸页面会自动降低渲染分辨率。

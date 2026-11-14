@@ -4912,6 +4912,7 @@ dependencies = [
  "image",
  "markdown",
  "quick-xml",
+ "resvg 0.46.0",
  "serde",
  "serde_json",
  "windows 0.62.2",

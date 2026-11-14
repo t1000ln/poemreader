@@ -200,6 +200,57 @@ pub fn print_excel(
     Ok(summary)
 }
 
+/// Print a picture on one page, scaled to fit the printable area.
+pub fn print_image(
+    hdc: HDC,
+    pixels: &RgbaImage,
+    width: i32,
+    height: i32,
+    dpi_x: i32,
+    dpi_y: i32,
+    range: &PageRange,
+) -> Result<PrintSummary, String> {
+    let _drawing = DrawingGuard;
+    let total = 1;
+    if !range.includes(0) {
+        return Ok(PrintSummary { printed: 0, total });
+    }
+
+    let margin_x = dpi_x as f32 * MARGIN_INCHES;
+    let margin_y = dpi_y as f32 * MARGIN_INCHES;
+    let printable_width = width as f32 - 2.0 * margin_x;
+    let printable_height = height as f32 - 2.0 * margin_y;
+    if printable_width < 72.0 || printable_height < 72.0 {
+        return Err(String::from("打印机没有足够的可打印区域"));
+    }
+
+    let (source_width, source_height) = pixels.dimensions();
+    if source_width == 0 || source_height == 0 {
+        blank_page(hdc)?;
+        return Ok(PrintSummary { printed: 1, total });
+    }
+
+    let factor =
+        (printable_width / source_width as f32).min(printable_height / source_height as f32);
+    let target_width = (source_width as f32 * factor).max(1.0);
+    let target_height = (source_height as f32 * factor).max(1.0);
+    let x = margin_x + (printable_width - target_width) * 0.5;
+    let y = margin_y + (printable_height - target_height) * 0.5;
+
+    start_page(hdc)?;
+    draw_rgba(
+        hdc,
+        &flatten_on_white(pixels),
+        x,
+        y,
+        target_width,
+        target_height,
+    );
+    end_page(hdc)?;
+
+    Ok(PrintSummary { printed: 1, total })
+}
+
 fn blank_page(hdc: HDC) -> Result<(), String> {
     start_page(hdc)?;
     end_page(hdc)
@@ -1264,6 +1315,24 @@ fn frame_rect(hdc: HDC, brushes: &mut Brushes, x: f32, y: f32, width: f32, heigh
     };
     let brush = brushes.get(rgb);
     let _ = unsafe { FrameRect(hdc, &rect, brush) };
+}
+
+/// Replace transparent pixels with white, so the paper shows the same picture
+/// the reader sees instead of the black that `StretchDIBits` would draw.
+fn flatten_on_white(image: &RgbaImage) -> RgbaImage {
+    let mut flat = image.clone();
+    let data: &mut [u8] = &mut flat;
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let alpha = pixel[3] as u32;
+        if alpha == 255 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+        }
+        pixel[3] = 255;
+    }
+    flat
 }
 
 fn draw_rgba(hdc: HDC, image: &RgbaImage, x: f32, y: f32, width: f32, height: f32) {

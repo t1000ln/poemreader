@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use image::RgbaImage;
+
 use crate::excel::Workbook;
 use crate::pdf::PdfSource;
 use crate::word::WordDocument;
@@ -20,6 +22,8 @@ pub enum PrintContent {
     Word(Arc<WordDocument>),
     /// A workbook, split into pages along its column and row boundaries.
     Excel(Arc<Workbook>),
+    /// A single picture, fitted to the printable area of one page.
+    Image { pixels: Arc<RgbaImage> },
 }
 
 /// A print request: the name shown in the spooler and the content to print.
@@ -141,6 +145,7 @@ mod imp {
     pub(super) fn print(owner: PrintOwner, job: PrintJob) -> Result<Option<PrintSummary>, String> {
         let known_pages = match &job.content {
             PrintContent::Pdf(source) => Some(source.page_count()),
+            PrintContent::Image { .. } => Some(1),
             _ => None,
         };
         let Some((hdc, range)) = open_dialog(owner, known_pages)? else {
@@ -182,6 +187,9 @@ mod imp {
             }
             PrintContent::Excel(workbook) => {
                 crate::print_office::print_excel(hdc, workbook, width, height, dpi_x, dpi_y, &range)
+            }
+            PrintContent::Image { pixels } => {
+                crate::print_office::print_image(hdc, pixels, width, height, dpi_x, dpi_y, &range)
             }
         };
 

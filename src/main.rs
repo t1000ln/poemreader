@@ -26,6 +26,7 @@ mod excel;
 mod markdown;
 mod ooxml;
 mod pdf;
+mod picture;
 mod print;
 #[cfg(windows)]
 mod print_office;
@@ -37,6 +38,7 @@ mod xls;
 use excel::Workbook;
 use ooxml::Package;
 use pdf::{PdfSource, PdfView};
+use picture::Picture;
 use print::{PrintContent, PrintJob};
 use settings::{PointerMode, ReadingBackground, Store};
 use text::TextView;
@@ -55,6 +57,19 @@ const PDF_PAGE_GAP: f32 = 20.;
 /// Pages kept rendered above and below the visible ones.
 const PDF_OVERSCAN: usize = 1;
 
+/// Space around a picture when it is fitted to the reading area, in logical
+/// pixels.
+const IMAGE_MARGIN: f32 = 26.0;
+/// A picture is never blown up more than this when it is fitted to the window,
+/// so a small icon does not fill the screen with a blurry square.
+const IMAGE_MAX_UPSCALE: f32 = 4.0;
+/// Range the wheel can zoom a picture to. It matches the range the settings
+/// keep, so a zoomed picture is restored at the same size next launch.
+const IMAGE_ZOOM_MIN: f32 = 0.5;
+const IMAGE_ZOOM_MAX: f32 = 4.0;
+/// How much one wheel line changes the zoom of a picture.
+const IMAGE_ZOOM_PER_LINE: f32 = 1.05;
+
 /// Padding and line spacing of the text body, in logical pixels. They are also
 /// used when placing the selection, so both must stay in one place.
 const TEXT_PADDING_X: f32 = 40.;
@@ -63,9 +78,9 @@ const TEXT_MAX_WIDTH: f32 = 880.;
 /// Height of a text row as a multiple of the font size.
 const LINE_HEIGHT_RATIO: f32 = 1.7;
 
-/// PDFs, Office documents and Markdown are decoded and held in memory as a
-/// whole, so they keep a size cap. Text files are wrapped into rows while being
-/// read and have no size limit.
+/// PDFs, Office documents, Markdown and pictures are decoded and held in
+/// memory as a whole, so they keep a size cap. Text files are wrapped into rows
+/// while being read and have no size limit.
 const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// How long the window has to stop resizing before the text is wrapped again.
@@ -212,6 +227,7 @@ enum DocumentKind {
     Word,
     Excel,
     Markdown,
+    Image,
 }
 
 /// What a background load produced. Held only long enough to build a
@@ -222,6 +238,7 @@ enum LoadedContent {
     Word(Arc<WordDocument>),
     Excel(Arc<Workbook>),
     Markdown(Arc<WordDocument>),
+    Image(Arc<Picture>),
 }
 
 /// The body of a loaded document.
@@ -231,6 +248,7 @@ enum DocumentContent {
     Word(Arc<WordDocument>),
     Excel(Arc<Workbook>),
     Markdown(Arc<WordDocument>),
+    Image(Arc<Picture>),
 }
 
 /// A loaded document.
@@ -263,6 +281,7 @@ impl Document {
             LoadedContent::Word(document) => DocumentContent::Word(document),
             LoadedContent::Excel(workbook) => DocumentContent::Excel(workbook),
             LoadedContent::Markdown(document) => DocumentContent::Markdown(document),
+            LoadedContent::Image(picture) => DocumentContent::Image(picture),
         };
 
         Self {
@@ -291,6 +310,21 @@ impl Document {
                     "{} · Excel · {} 个工作表",
                     self.file_name,
                     workbook.sheets.len()
+                )
+            }
+            DocumentContent::Image(picture) => {
+                let frames = if picture.frame_count() > 1 {
+                    format!(" · {} 帧", picture.frame_count())
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} · {}{} · {} × {}",
+                    self.file_name,
+                    picture.format,
+                    frames,
+                    picture.natural_width.round() as u32,
+                    picture.natural_height.round() as u32
                 )
             }
         }
@@ -898,7 +932,8 @@ impl PoemReader {
         )
     }
 
-    /// Formats that hold text the reader can drag over; PDF pages are images.
+    /// Formats that hold text the reader can drag over; PDF pages and picture
+    /// documents cannot be selected.
     fn supports_selection(&self) -> bool {
         matches!(
             self.document.as_ref().map(|document| &document.content),
@@ -1358,6 +1393,9 @@ impl PoemReader {
                 PrintContent::Word(word.clone())
             }
             DocumentContent::Excel(workbook) => PrintContent::Excel(workbook.clone()),
+            DocumentContent::Image(picture) => PrintContent::Image {
+                pixels: picture.pixels.clone(),
+            },
         };
 
         Some(PrintJob {
@@ -1590,6 +1628,95 @@ impl PoemReader {
         cx.notify();
     }
 
+    /// Zoom a picture with the wheel, keeping the point under the pointer in
+    /// place. The picture is moved by dragging it or with the scrollbars.
+    fn zoom_image_at(&mut self, event: &ScrollEvent, window: &Window, cx: &mut Context<Self>) {
+        let Some(DocumentContent::Image(picture)) =
+            self.document.as_ref().map(|document| &document.content)
+        else {
+            return;
+        };
+
+        // A touch pan scrolls the picture like any other document; only a
+        // wheel or trackpad scroll zooms.
+        if event.source == ScrollSource::Touch {
+            return;
+        }
+
+        let line_height = window.line_height();
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => delta.y.as_f32() / line_height.as_f32().max(1.0),
+        };
+        if lines.abs() < f32::EPSILON {
+            return;
+        }
+
+        let viewport = self.scroll_viewport(window);
+        // The scroll area handles the wheel before this listener runs, so undo
+        // that scroll: the wheel zooms instead of moving the picture. It also
+        // drops one axis of a diagonal scroll, so undo the same amount.
+        let mut applied = event.delta.pixel_delta(line_height);
+        if !applied.x.is_zero() && !applied.y.is_zero() {
+            if applied.x.abs() > applied.y.abs() {
+                applied.y = Pixels::ZERO;
+            } else {
+                applied.x = Pixels::ZERO;
+            }
+        }
+        let offset = self.scroll_handle.offset() - applied;
+
+        let (width, height) = image_layout(picture, viewport, self.pdf_zoom);
+        let content_width = (width + 2.0 * IMAGE_MARGIN).max(viewport.width);
+        let content_height = (height + 2.0 * IMAGE_MARGIN).max(viewport.height);
+        let image_origin = point(
+            px((content_width - width) / 2.0),
+            px((content_height - height) / 2.0),
+        );
+
+        // The picture keeps the same spot under the pointer after it is scaled.
+        // A pointer in the margin zooms around the centre instead of dragging
+        // the nearest edge under itself.
+        let pointer = event.position - self.scroll_handle.bounds().origin;
+        let content = pointer - offset;
+        let x = (content.x - image_origin.x).as_f32() / width;
+        let y = (content.y - image_origin.y).as_f32() / height;
+        let anchor = if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) {
+            point(x, y)
+        } else {
+            point(0.5, 0.5)
+        };
+
+        let zoom =
+            (self.pdf_zoom * IMAGE_ZOOM_PER_LINE.powf(lines)).clamp(IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX);
+        if (zoom - self.pdf_zoom).abs() < f32::EPSILON {
+            // At the limit the wheel does nothing, so put the scroll back as
+            // well instead of letting the picture drift.
+            self.scroll_handle.set_offset(offset);
+            cx.notify();
+            return;
+        }
+
+        let (new_width, new_height) = image_layout(picture, viewport, zoom);
+        let new_content_width = (new_width + 2.0 * IMAGE_MARGIN).max(viewport.width);
+        let new_content_height = (new_height + 2.0 * IMAGE_MARGIN).max(viewport.height);
+        let new_image_origin = point(
+            px((new_content_width - new_width) / 2.0),
+            px((new_content_height - new_height) / 2.0),
+        );
+        let new_offset = point(
+            pointer.x - new_image_origin.x - px(anchor.x * new_width),
+            pointer.y - new_image_origin.y - px(anchor.y * new_height),
+        );
+
+        self.pdf_zoom = zoom;
+        self.store.borrow_mut().settings_mut().pdf_zoom = zoom;
+        self.persist_settings();
+        self.scroll_handle.set_offset(new_offset);
+        self.latest_position.set(None);
+        cx.notify();
+    }
+
     fn set_background(&mut self, background: ReadingBackground, cx: &mut App) {
         self.background = background;
         self.store.borrow_mut().settings_mut().background = background;
@@ -1638,7 +1765,8 @@ impl PoemReader {
             DocumentContent::Text(_)
             | DocumentContent::Word(_)
             | DocumentContent::Excel(_)
-            | DocumentContent::Markdown(_) => self.scroll_handle.offset().y.as_f32(),
+            | DocumentContent::Markdown(_)
+            | DocumentContent::Image(_) => self.scroll_handle.offset().y.as_f32(),
             DocumentContent::Pdf(view) => self
                 .pdf_layout(view, window)
                 .anchor_for_offset(self.scroll_offset()),
@@ -1837,6 +1965,9 @@ impl PoemReader {
             }
             Some(DocumentContent::Excel(_)) => {
                 return self.render_excel_body(window, foreground, cx);
+            }
+            Some(DocumentContent::Image(_)) => {
+                return self.render_image_body(window, foreground, cx);
             }
             _ => {}
         }
@@ -2336,6 +2467,101 @@ impl PoemReader {
 
         root.into_any_element()
     }
+
+    /// A picture is fitted to the reading area, and zooming in makes it larger
+    /// than the window so it can be scrolled in both directions.
+    fn render_image_body(
+        &self,
+        window: &mut Window,
+        foreground: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(DocumentContent::Image(picture)) =
+            self.document.as_ref().map(|document| &document.content)
+        else {
+            return empty_body(foreground);
+        };
+
+        let viewport = self.scroll_viewport(window);
+        let (width, height) = image_layout(picture, viewport, self.pdf_zoom);
+        let content_width = (width + 2.0 * IMAGE_MARGIN).max(viewport.width);
+        let content_height = (height + 2.0 * IMAGE_MARGIN).max(viewport.height);
+
+        let content = div()
+            .flex_shrink_0()
+            .w(px(content_width))
+            .h(px(content_height))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(img(picture.image()).w(px(width)).h(px(height)));
+
+        let mut root = div()
+            .id("image-scroll-root")
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                self.reading_area(
+                    div()
+                        .id("image-scroll")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .overflow_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .on_scroll(cx.listener(|this, _, window, cx| {
+                            this.schedule_position_save(window, cx)
+                        }))
+                        .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                            this.zoom_image_at(event, window, cx)
+                        }))
+                        .child(content),
+                    cx,
+                ),
+            )
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&self.scroll_handle)
+                        .id("image-scrollbar")
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
+            );
+
+        // Only a picture wider than the window needs horizontal scrolling.
+        if content_width > viewport.width + 0.5 {
+            root = root.child(
+                div().absolute().inset_0().child(
+                    Scrollbar::horizontal(&self.scroll_handle)
+                        .id("image-scrollbar-x")
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
+            );
+        }
+
+        root.into_any_element()
+    }
+}
+
+/// Size of a picture on screen: fitted to the reading area, then scaled by the
+/// page zoom, and never blown up more than [`IMAGE_MAX_UPSCALE`].
+fn image_layout(picture: &Picture, viewport: Size<f32>, zoom: f32) -> (f32, f32) {
+    let available_width = (viewport.width - 2.0 * IMAGE_MARGIN).max(80.0);
+    let available_height = (viewport.height - 2.0 * IMAGE_MARGIN).max(80.0);
+    let fit = (available_width / picture.width)
+        .min(available_height / picture.height)
+        .min(IMAGE_MAX_UPSCALE);
+    let scale = (fit * zoom).max(0.01);
+
+    (
+        (picture.width * scale).max(1.0),
+        (picture.height * scale).max(1.0),
+    )
 }
 
 /// Width available to the text block for a given window width, in logical
@@ -3015,8 +3241,8 @@ fn build_reading_menu(
     let menu = menu.min_w(px(240.));
 
     if !selectable {
-        // PDF pages are images and Word / Excel documents are laid out from
-        // their own model, so only panning makes sense here.
+        // PDF pages and pictures are images, and Word / Excel documents are
+        // laid out from their own model, so only panning makes sense here.
         return menu
             .item(
                 PopupMenuItem::new("拖拽平移（此文档不支持划选）")
@@ -3150,15 +3376,16 @@ fn show_about(window: &mut Window, cx: &mut App) {
                     .child("· 支持 Markdown（.md）：标题、强调、列表、表格、代码块、引用与图片")
                     .child("· 支持 Word（.docx）：段落样式、字符格式、列表、表格与图片")
                     .child("· 支持 Excel（.xlsx）：单元格字体、颜色、边框、数字格式与多工作表")
+                    .child("· 支持图片：JPEG、PNG、BMP、WebP、ICO、GIF（含动画）与 SVG")
                     .child("· 「文件 → 加载文件…」打开本地文件")
                     .child("· 也可以把文件从系统拖入窗口直接打开")
-                    .child("· 纯文本按行渲染，Markdown / Word / Excel 按自身排版绘制，PDF 按页渲染")
-                    .child("· 所有文档都支持滚轮与鼠标拖拽平移")
+                    .child("· 纯文本按行渲染，Markdown / Word / Excel 按自身排版绘制，PDF 按页渲染，图片按窗口大小适配")
+                    .child("· 所有文档都支持鼠标拖拽平移，图片还可用鼠标滚轮缩放")
                     .child("· 纯文本可用右键菜单切换「拖拽平移 / 划选文字」")
                     .child("· 划选后用 Ctrl+C 或右键菜单「复制所选文字」复制")
-                    .child("· 「文件 → 打印…」或 Ctrl+P 打印文本、Markdown、PDF、Word 与 Excel")
+                    .child("· 「文件 → 打印…」或 Ctrl+P 打印文本、Markdown、PDF、Word、Excel 与图片")
                     .child("· 打印对话框中可选「页码」只打印指定页或页码范围")
-                    .child("· 「字体大小」调整纯文本；Markdown / PDF / Word / Excel 为「页面缩放」")
+                    .child("· 「字体大小」调整纯文本；Markdown / PDF / Word / Excel / 图片为「页面缩放」")
                     .child("· 「窗口背景色」切换阅读配色")
                     .child("· 字号、缩放、配色和阅读位置会自动保存，下次启动时恢复"),
             )
@@ -3188,11 +3415,23 @@ fn load_document(path: &Path) -> Result<(DocumentKind, LoadedContent), String> {
             )
         });
     }
+    if is_image_path(path) {
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        return Picture::load(bytes, base)
+            .map(|picture| (DocumentKind::Image, LoadedContent::Image(Arc::new(picture))));
+    }
     if bytes.starts_with(b"PK\x03\x04") {
         return load_office(bytes);
     }
     if is_compound_file(&bytes) {
         return load_compound_office(path, bytes);
+    }
+
+    // A file without a known extension may still be a picture.
+    if picture::looks_like_image(&bytes) {
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        return Picture::load(bytes, base)
+            .map(|picture| (DocumentKind::Image, LoadedContent::Image(Arc::new(picture))));
     }
 
     Ok((DocumentKind::Text, LoadedContent::Text(decode_text(bytes))))
@@ -3218,7 +3457,7 @@ fn load_office(bytes: Vec<u8>) -> Result<(DocumentKind, LoadedContent), String> 
 
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("无法读取文件信息：{error}"))?;
-    if (is_pdf_path(path) || is_office_path(path) || is_markdown_path(path))
+    if (is_pdf_path(path) || is_office_path(path) || is_markdown_path(path) || is_image_path(path))
         && metadata.len() > MAX_DOCUMENT_BYTES
     {
         return Err(format!(
@@ -3244,6 +3483,15 @@ fn is_office_path(path: &Path) -> bool {
 
 fn is_markdown_path(path: &Path) -> bool {
     has_extension(path, &["md", "markdown", "mdown", "mkd", "mkdn"])
+}
+
+fn is_image_path(path: &Path) -> bool {
+    has_extension(
+        path,
+        &[
+            "jpg", "jpeg", "jpe", "jfif", "png", "bmp", "dib", "webp", "ico", "gif", "svg", "svgz",
+        ],
+    )
 }
 
 /// Legacy Word and Excel documents share the OLE2 container; which one it is
