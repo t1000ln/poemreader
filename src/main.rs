@@ -1351,7 +1351,7 @@ impl PoemReader {
         })
     }
 
-    /// Ask the platform for a file and load it in the background.
+    /// Ask the platform for a file and open it.
     fn load_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1360,7 +1360,9 @@ impl PoemReader {
             prompt: Some("打开".into()),
         });
 
-        self.load_task = Some(cx.spawn_in(window, async move |view, cx| {
+        // Nothing to track while the dialog is open, so the prompt runs
+        // detached; the load it starts is tracked in `load_task`.
+        cx.spawn_in(window, async move |view, cx| {
             let path = match receiver.await {
                 Ok(Ok(Some(mut paths))) => match paths.pop() {
                     Some(path) => path,
@@ -1378,9 +1380,35 @@ impl PoemReader {
                 Err(_) => return,
             };
 
-            // Parsing and rasterizing a PDF can take a moment, so keep it off
-            // the UI thread.
-            let read_path = path.clone();
+            view.update_in(cx, |this, window, cx| this.open_path(path, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Open the first file dropped onto the window from outside the
+    /// application. Folders cannot be opened, so they are skipped.
+    fn open_dropped_files(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match paths.paths().iter().find(|path| path.is_file()).cloned() {
+            Some(path) => self.open_path(path, window, cx),
+            None => window.push_notification(
+                Notification::error("无法打开拖入的内容：请拖入一个文件"),
+                cx,
+            ),
+        }
+    }
+
+    /// Load the document at `path` in the background and show it.
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // Parsing and rasterizing a PDF can take a moment, so keep it off the
+        // UI thread.
+        let read_path = path.clone();
+        self.load_task = Some(cx.spawn_in(window, async move |view, cx| {
             let loaded = cx
                 .background_spawn(async move { load_document(&read_path) })
                 .await;
@@ -2321,7 +2349,7 @@ fn empty_body(foreground: Hsla) -> AnyElement {
                     div()
                         .text_sm()
                         .opacity(0.65)
-                        .child("使用菜单「文件 → 加载文件…」选择一个文本、PDF、Word 或 Excel 文件"),
+                        .child("使用菜单「文件 → 加载文件…」或把文件拖入窗口，打开文本、PDF、Word 或 Excel 文件"),
                 ),
         )
         .into_any_element()
@@ -3051,6 +3079,11 @@ impl Render for PoemReader {
             .text_color(foreground)
             .child(title_bar)
             .child(body)
+            // Files dragged in from the system arrive as an `ExternalPaths`
+            // drag, so the whole window is a drop target.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.open_dropped_files(paths, window, cx);
+            }))
     }
 }
 
@@ -3070,6 +3103,7 @@ fn show_about(window: &mut Window, cx: &mut App) {
                     .child("· 支持 Word（.docx）：段落样式、字符格式、列表、表格与图片")
                     .child("· 支持 Excel（.xlsx）：单元格字体、颜色、边框、数字格式与多工作表")
                     .child("· 「文件 → 加载文件…」打开本地文件")
+                    .child("· 也可以把文件从系统拖入窗口直接打开")
                     .child("· 纯文本按行渲染，PDF 按页渲染，Word / Excel 按自身排版绘制")
                     .child("· 所有文档都支持滚轮与鼠标拖拽平移")
                     .child("· 纯文本可用右键菜单切换「拖拽平移 / 划选文字」")
