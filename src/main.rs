@@ -1,6 +1,16 @@
 // GUI subsystem in every profile: no console window is created, in debug or release.
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+//! 入口与阅读视图。
+//!
+//! 这里放的是「视图本身」：`Document` 是加载结果在界面上的形态，`PoemReader`
+//! 持有窗口状态，负责命中测试（指针落在哪一行、哪个字符、哪个单元格）、
+//! 按格式编排渲染，以及标题栏与菜单。
+//!
+//! 周边职责都在同级模块：建窗口在 `window`，鼠标与拖放在 `events`，快捷键在
+//! `shortcuts`，读文件在 `loader`，排版细节在 `render`。视图状态只在这里定义，
+//! 其他模块通过 `pub(crate)` 字段直接读写，没有再包一层访问器。
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;

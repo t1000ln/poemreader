@@ -1,3 +1,13 @@
+//! 配置的读写。
+//!
+//! 设置以 JSON 存在用户配置目录：Windows 是 `%APPDATA%\PoemReader\settings.json`，
+//! 其他平台在 `$XDG_CONFIG_HOME/poemreader/`（回退到 `~/.config`）。文件缺失、
+//! 无法读取或解析失败时整体退回默认值；文件存在但少了某些字段时，每一项各自
+//! 取默认值（`#[serde(default)]`）。所以删掉配置文件只影响偏好，不影响启动。
+//!
+//! 阅读位置按文件的**绝对路径**保存，同一个文件用相对路径还是绝对路径打开都回到
+//! 同一处；PDF 存的是「第几页 + 页内比例」，缩放与窗口尺寸变化后依然对得上。
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
