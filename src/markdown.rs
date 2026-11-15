@@ -601,7 +601,11 @@ impl Builder<'_> {
             return None;
         }
 
-        let render = RenderImage::new(vec![Frame::new(pixels.clone())]);
+        // The window reads a texture as BGRA, so the copy it draws is
+        // converted; the printer keeps the straight RGBA one.
+        let mut display = pixels.clone();
+        crate::picture::to_render_pixels(&mut display);
+        let render = RenderImage::new(vec![Frame::new(display)]);
         // Images are authored for screens, where 96 pixels are 72 points.
         let mut width = width as f32 * 72.0 / 96.0;
         let mut height = height as f32 * 72.0 / 96.0;

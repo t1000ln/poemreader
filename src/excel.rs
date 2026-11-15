@@ -283,7 +283,8 @@ pub fn load(package: &Package) -> Result<Workbook, String> {
         .and_then(|properties| properties.attr("date1904"))
         .map(|value| !matches!(value.as_str(), "0" | "false"))
         .unwrap_or(false);
-    let styles = styles_of(style_tree.as_ref());
+    let theme = theme_of(package_theme(package));
+    let styles = styles_of(style_tree.as_ref(), &theme);
 
     let rels = package.rels("xl/workbook.xml");
     let mut sheets = Vec::new();
@@ -386,33 +387,12 @@ fn parse_sheet(
                     next_column = 0;
                 }
                 b"c" => {
-                    let (row, column) = match attr(&event, "r") {
-                        Some(reference) => {
-                            cell_reference(&reference).unwrap_or((next_column, row_index))
-                        }
-                        None => (next_column, row_index),
-                    };
-                    next_column = column.saturating_add(1);
-                    row_index = row;
-                    let style = attr(&event, "s")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(0)
-                        .min(styles.len().saturating_sub(1));
-                    let kind = match attr(&event, "t").as_deref() {
-                        Some("s") => CellKind::Shared,
-                        Some("inlineStr") => CellKind::Inline,
-                        Some("str") => CellKind::Text,
-                        Some("b") => CellKind::Boolean,
-                        Some("e") => CellKind::Error,
-                        _ => CellKind::Number,
-                    };
-                    cell = Some(CellBuilder {
-                        row,
-                        column,
-                        style,
-                        kind,
-                        raw: String::new(),
-                    });
+                    cell = Some(cell_builder(
+                        &event,
+                        styles,
+                        &mut row_index,
+                        &mut next_column,
+                    ));
                     in_value = false;
                 }
                 b"v" => in_value = true,
@@ -428,14 +408,10 @@ fn parse_sheet(
                     next_column = 0;
                 }
                 b"c" => {
-                    let (row, column) = match attr(&event, "r") {
-                        Some(reference) => {
-                            cell_reference(&reference).unwrap_or((next_column, row_index))
-                        }
-                        None => (next_column, row_index),
-                    };
-                    next_column = column.saturating_add(1);
-                    row_index = row;
+                    // Excel writes a cell that holds only formatting as an
+                    // empty element, so it never reaches the `Start` arm above.
+                    let builder = cell_builder(&event, styles, &mut row_index, &mut next_column);
+                    push_cell(&mut data, builder, String::new(), styles);
                 }
                 b"col" => read_columns(&event, &mut data),
                 b"mergeCell" => read_merge(&event, &mut data),
@@ -454,18 +430,7 @@ fn parse_sheet(
                 b"c" => {
                     if let Some(builder) = cell.take() {
                         let text = resolve_text(&builder, shared, styles, date1904);
-                        let text = text.trim_end().to_string();
-                        if !text.is_empty() {
-                            data.cells.push(RawCell {
-                                row: builder.row,
-                                column: builder.column,
-                                style: builder.style,
-                                text,
-                                numeric: builder.kind == CellKind::Number,
-                            });
-                        }
-                        data.max_row = data.max_row.max(builder.row);
-                        data.max_column = data.max_column.max(builder.column);
+                        push_cell(&mut data, builder, text, styles);
                     }
                     in_value = false;
                     phonetic_depth = 0;
@@ -480,6 +445,66 @@ fn parse_sheet(
     }
 
     finish_sheet(data, styles)
+}
+
+/// Read the attributes of a `<c>` element and note where the next cell sits.
+fn cell_builder(
+    event: &quick_xml::events::BytesStart<'_>,
+    styles: &[CellStyle],
+    row_index: &mut u32,
+    next_column: &mut u32,
+) -> CellBuilder {
+    let (row, column) = match attr(event, "r") {
+        Some(reference) => cell_reference(&reference).unwrap_or((*next_column, *row_index)),
+        None => (*next_column, *row_index),
+    };
+    *next_column = column.saturating_add(1);
+    *row_index = row;
+    let style = attr(event, "s")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(styles.len().saturating_sub(1));
+    let kind = match attr(event, "t").as_deref() {
+        Some("s") => CellKind::Shared,
+        Some("inlineStr") => CellKind::Inline,
+        Some("str") => CellKind::Text,
+        Some("b") => CellKind::Boolean,
+        Some("e") => CellKind::Error,
+        _ => CellKind::Number,
+    };
+    CellBuilder {
+        row,
+        column,
+        style,
+        kind,
+        raw: String::new(),
+    }
+}
+
+/// Add a finished cell to the sheet.
+///
+/// A cell without text is worth keeping when it is shaded or ruled: on the
+/// sheet it is a coloured block or a piece of the table's grid, not a blank.
+fn push_cell(data: &mut SheetData, builder: CellBuilder, text: String, styles: &[CellStyle]) {
+    let text = text.trim_end().to_string();
+    let decorated = styles.get(builder.style).is_some_and(|style| {
+        style.fill.is_some()
+            || style.border_top.is_some()
+            || style.border_bottom.is_some()
+            || style.border_left.is_some()
+            || style.border_right.is_some()
+    });
+    if !text.is_empty() || decorated {
+        data.cells.push(RawCell {
+            row: builder.row,
+            column: builder.column,
+            style: builder.style,
+            text,
+            numeric: builder.kind == CellKind::Number,
+        });
+    }
+    data.max_row = data.max_row.max(builder.row);
+    data.max_column = data.max_column.max(builder.column);
 }
 
 /// The display text of a cell, from its stored value and type.
@@ -768,9 +793,219 @@ fn shared_strings(xml: &str) -> Vec<String> {
     strings
 }
 
+// --------------------------------------------------------------------- colours
+
+/// The colours of the workbook theme.
+///
+/// A colour in the style sheet can name a theme entry by index instead of an
+/// RGB value, which is what Excel writes for every fill picked from its palette.
+/// The indexes follow the order the palette shows — the two background/text
+/// pairs first, then the six accents and the two link colours — and not the
+/// order the theme part stores them in.
+struct Theme {
+    colors: Vec<u32>,
+}
+
+/// Office's own theme, used when a package carries no theme part.
+const DEFAULT_THEME: [u32; 12] = [
+    0xFFFFFF, 0x000000, // background 1, text 1
+    0xE7E6E6, 0x44546A, // background 2, text 2
+    0x4472C4, 0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47, // accents 1 to 6
+    0x0563C1, 0x954F72, // hyperlink, followed hyperlink
+];
+
+/// Excel's legacy palette, which an `indexed` colour refers to.
+const INDEXED_COLORS: [u32; 64] = [
+    0x000000, 0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0x000000,
+    0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0x800000, 0x008000,
+    0x000080, 0x808000, 0x800080, 0x008080, 0xC0C0C0, 0x808080, 0x9999FF, 0x993366, 0xFFFFCC,
+    0xCCFFFF, 0x660066, 0xFF8080, 0x0066CC, 0xCCCCFF, 0x000080, 0xFF00FF, 0xFFFF00, 0x00FFFF,
+    0x800080, 0x800000, 0x008080, 0x0000FF, 0x00CCFF, 0xCCFFFF, 0xCCFFCC, 0xFFFF99, 0x99CCFF,
+    0xFF99CC, 0xCC99FF, 0xFFCC99, 0x3366FF, 0x33CCCC, 0x99CC00, 0xFFCC00, 0xFF9900, 0xFF6600,
+    0x666699, 0x969696, 0x003366, 0x339966, 0x003300, 0x333300, 0x993300, 0x993366, 0x333399,
+    0x333333,
+];
+
+impl Theme {
+    fn fallback() -> Self {
+        Self {
+            colors: DEFAULT_THEME.to_vec(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<u32> {
+        self.colors.get(index).copied()
+    }
+}
+
+fn theme_of(xml: Option<String>) -> Theme {
+    let mut theme = Theme::fallback();
+    let Some(root) = xml.as_deref().and_then(|xml| parse_tree(xml).ok()) else {
+        return theme;
+    };
+    let Some(scheme) = root.descendant("clrScheme") else {
+        return theme;
+    };
+    for entry in &scheme.children {
+        let Some(slot) = theme_slot(&entry.name) else {
+            continue;
+        };
+        // `srgbClr` carries the colour itself; `sysClr` names a system colour
+        // and keeps the one it stood for in `lastClr`.
+        let value = entry.children.iter().find_map(|color| match color.name.as_str() {
+            "srgbClr" => color.attr("val"),
+            "sysClr" => color.attr("lastClr"),
+            _ => None,
+        });
+        if let Some(color) = value.and_then(|value| parse_hex_color(&value)) {
+            theme.colors[slot] = color;
+        }
+    }
+    theme
+}
+
+/// Where a colour scheme entry sits in Excel's palette order.
+fn theme_slot(name: &str) -> Option<usize> {
+    Some(match name {
+        "lt1" => 0,
+        "dk1" => 1,
+        "lt2" => 2,
+        "dk2" => 3,
+        "accent1" => 4,
+        "accent2" => 5,
+        "accent3" => 6,
+        "accent4" => 7,
+        "accent5" => 8,
+        "accent6" => 9,
+        "hlink" => 10,
+        "folHlink" => 11,
+        _ => return None,
+    })
+}
+
+/// The theme part of a package, wherever the writer put it.
+fn package_theme(package: &Package) -> Option<String> {
+    ["xl/theme/theme1.xml", "xl/theme/theme2.xml"]
+        .into_iter()
+        .find_map(|path| package.xml(path))
+}
+
+/// An `rgb`, `indexed` or `theme` colour, as `0xRRGGBB`.
+fn resolve_color(node: &Node, theme: &Theme) -> Option<u32> {
+    let tint = node
+        .attr("tint")
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+
+    if let Some(rgb) = node.attr("rgb").and_then(|value| parse_hex_color(&value)) {
+        return Some(apply_tint(rgb, tint));
+    }
+    if let Some(index) = node
+        .attr("indexed")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        // 64 and 65 are the system window colours, which on paper are the
+        // ordinary black and white.
+        let rgb = match index {
+            64 => Some(0x000000),
+            65 => Some(0xFFFFFF),
+            _ => INDEXED_COLORS.get(index).copied(),
+        };
+        return rgb.map(|rgb| apply_tint(rgb, tint));
+    }
+    if let Some(index) = node
+        .attr("theme")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        return theme.get(index).map(|rgb| apply_tint(rgb, tint));
+    }
+    None
+}
+
+/// Lighten or darken a colour the way Excel does: the tint moves the
+/// lightness of the colour in HLS, leaving its hue and saturation alone.
+fn apply_tint(rgb: u32, tint: f32) -> u32 {
+    if !tint.is_finite() || tint == 0.0 {
+        return rgb;
+    }
+    let red = ((rgb >> 16) & 0xFF) as f64 / 255.0;
+    let green = ((rgb >> 8) & 0xFF) as f64 / 255.0;
+    let blue = (rgb & 0xFF) as f64 / 255.0;
+
+    let (hue, lightness, saturation) = rgb_to_hls(red, green, blue);
+    let tint = tint as f64;
+    let lightness = if tint < 0.0 {
+        lightness * (1.0 + tint)
+    } else {
+        lightness * (1.0 - tint) + tint
+    };
+    let (red, green, blue) = hls_to_rgb(hue, lightness, saturation);
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(red) << 16) | (channel(green) << 8) | channel(blue)
+}
+
+fn rgb_to_hls(red: f64, green: f64, blue: f64) -> (f64, f64, f64) {
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let lightness = (max + min) / 2.0;
+    if max == min {
+        return (0.0, lightness, 0.0);
+    }
+    let delta = max - min;
+    let saturation = if lightness < 0.5 {
+        delta / (max + min)
+    } else {
+        delta / (2.0 - max - min)
+    };
+    let hue = if max == red {
+        (green - blue) / delta + if green < blue { 6.0 } else { 0.0 }
+    } else if max == green {
+        (blue - red) / delta + 2.0
+    } else {
+        (red - green) / delta + 4.0
+    };
+    (hue / 6.0, lightness, saturation)
+}
+
+fn hls_to_rgb(hue: f64, lightness: f64, saturation: f64) -> (f64, f64, f64) {
+    if saturation <= 0.0 {
+        return (lightness, lightness, lightness);
+    }
+    let other = if lightness < 0.5 {
+        lightness * (1.0 + saturation)
+    } else {
+        lightness + saturation - lightness * saturation
+    };
+    let first = 2.0 * lightness - other;
+    (
+        hue_channel(first, other, hue + 1.0 / 3.0),
+        hue_channel(first, other, hue),
+        hue_channel(first, other, hue - 1.0 / 3.0),
+    )
+}
+
+fn hue_channel(first: f64, other: f64, hue: f64) -> f64 {
+    let hue = if hue < 0.0 {
+        hue + 1.0
+    } else if hue > 1.0 {
+        hue - 1.0
+    } else {
+        hue
+    };
+    if hue * 6.0 < 1.0 {
+        first + (other - first) * hue * 6.0
+    } else if hue * 2.0 < 1.0 {
+        other
+    } else if hue * 3.0 < 2.0 {
+        first + (other - first) * (2.0 / 3.0 - hue) * 6.0
+    } else {
+        first
+    }
+}
+
 // ---------------------------------------------------------------------- styles
 
-fn styles_of(node: Option<&Node>) -> Vec<CellStyle> {
+fn styles_of(node: Option<&Node>, theme: &Theme) -> Vec<CellStyle> {
     let Some(node) = node else {
         return vec![CellStyle::default()];
     };
@@ -780,7 +1015,7 @@ fn styles_of(node: Option<&Node>) -> Vec<CellStyle> {
         .map(|fonts| {
             fonts
                 .children_named("font")
-                .map(font_of)
+                .map(|font| font_of(font, theme))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -789,7 +1024,7 @@ fn styles_of(node: Option<&Node>) -> Vec<CellStyle> {
         .map(|fills| {
             fills
                 .children_named("fill")
-                .map(fill_of)
+                .map(|fill| fill_of(fill, theme))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -798,7 +1033,7 @@ fn styles_of(node: Option<&Node>) -> Vec<CellStyle> {
         .map(|borders| {
             borders
                 .children_named("border")
-                .map(border_of)
+                .map(|border| border_of(border, theme))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -886,7 +1121,7 @@ struct FontData {
     color: Option<u32>,
 }
 
-fn font_of(node: &Node) -> FontData {
+fn font_of(node: &Node, theme: &Theme) -> FontData {
     FontData {
         bold: is_true(node.child("b")),
         italic: is_true(node.child("i")),
@@ -901,8 +1136,7 @@ fn font_of(node: &Node) -> FontData {
             .unwrap_or(DEFAULT_FONT_SIZE),
         color: node
             .child("color")
-            .and_then(|color| color.attr("rgb"))
-            .and_then(|value| parse_hex_color(&value)),
+            .and_then(|color| resolve_color(color, theme)),
     }
 }
 
@@ -913,15 +1147,24 @@ fn is_true(node: Option<&Node>) -> bool {
     })
 }
 
-fn fill_of(node: &Node) -> Option<u32> {
-    let pattern = node.child("patternFill")?;
-    if pattern.attr("patternType").as_deref() == Some("none") {
-        return None;
+fn fill_of(node: &Node, theme: &Theme) -> Option<u32> {
+    if let Some(pattern) = node.child("patternFill") {
+        if pattern.attr("patternType").as_deref() == Some("none") {
+            return None;
+        }
+        // A solid fill names its colour in `fgColor`, but some writers put it
+        // in `bgColor` and leave the first one out.
+        return ["fgColor", "bgColor"]
+            .into_iter()
+            .find_map(|name| pattern.child(name).and_then(|color| resolve_color(color, theme)));
     }
-    pattern
-        .child("fgColor")
-        .and_then(|color| color.attr("rgb"))
-        .and_then(|value| parse_hex_color(&value))
+
+    // A gradient is painted with its first stop, which is close enough to the
+    // shading a cell shows on screen.
+    node.child("gradientFill")
+        .and_then(|gradient| gradient.children_named("stop").next())
+        .and_then(|stop| stop.child("color"))
+        .and_then(|color| resolve_color(color, theme))
 }
 
 struct BorderData {
@@ -931,7 +1174,7 @@ struct BorderData {
     right: Option<u32>,
 }
 
-fn border_of(node: &Node) -> BorderData {
+fn border_of(node: &Node, theme: &Theme) -> BorderData {
     let side = |name: &str| -> Option<u32> {
         let element = node.child(name)?;
         let style = element.attr("style").unwrap_or_default();
@@ -941,8 +1184,7 @@ fn border_of(node: &Node) -> BorderData {
         Some(
             element
                 .child("color")
-                .and_then(|color| color.attr("rgb"))
-                .and_then(|value| parse_hex_color(&value))
+                .and_then(|color| resolve_color(color, theme))
                 .unwrap_or(0x808080),
         )
     };
@@ -1439,4 +1681,112 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (y + i64::from(month <= 2), month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(xml: &str) -> Node {
+        root_of(parse_tree(xml).expect("well formed xml"))
+    }
+
+    /// The theme part of a workbook written by Excel.
+    const THEME: &str = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        <a:themeElements>
+            <a:clrScheme name="Office">
+                <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+                <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+                <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+                <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+                <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+                <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+                <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+                <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+                <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+                <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+                <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+                <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+            </a:clrScheme>
+        </a:themeElements>
+    </a:theme>"#;
+
+    /// Two cell formats: plain, and one shaded with a theme colour.
+    const STYLES: &str = r#"<styleSheet>
+        <fonts count="1"><font><sz val="11"/><color theme="1"/></font></fonts>
+        <fills count="2">
+            <fill><patternFill patternType="none"/></fill>
+            <fill><patternFill patternType="solid">
+                <fgColor theme="4" tint="-0.249977111117893"/><bgColor indexed="64"/>
+            </patternFill></fill>
+        </fills>
+        <borders count="1"><border><left/><right/><top/><bottom/></border></borders>
+        <cellXfs count="3">
+            <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+            <xf numFmtId="0" fontId="0" fillId="1" borderId="0"/>
+            <xf numFmtId="0" fontId="0" fillId="0" borderId="0">
+                <alignment wrapText="1"/>
+            </xf>
+        </cellXfs>
+    </styleSheet>"#;
+
+    fn styles() -> Vec<CellStyle> {
+        styles_of(Some(&root(STYLES)), &theme_of(Some(THEME.to_string())))
+    }
+
+    #[test]
+    fn a_theme_colour_resolves_to_its_rgb_value() {
+        let theme = theme_of(Some(THEME.to_string()));
+        assert_eq!(theme.get(0), Some(0xFFFFFF), "background 1 is white");
+        assert_eq!(theme.get(1), Some(0x000000), "text 1 is black");
+        assert_eq!(theme.get(4), Some(0x4472C4), "accent 1");
+    }
+
+    #[test]
+    fn a_shaded_cell_keeps_its_fill() {
+        let styles = styles();
+        // Blue, accent 1, darker 25%, which is what Excel paints for a header.
+        assert_eq!(styles[1].fill, Some(0x2F5597));
+    }
+
+    #[test]
+    fn a_tint_moves_the_lightness_of_the_colour() {
+        assert_eq!(apply_tint(0x4472C4, 0.4), 0x8FAADC);
+        assert_eq!(apply_tint(0x4472C4, -0.5), 0x203864);
+        assert_eq!(apply_tint(0x4472C4, 0.0), 0x4472C4);
+    }
+
+    #[test]
+    fn an_indexed_colour_uses_excels_palette() {
+        let theme = Theme::fallback();
+        let color = root(r#"<fgColor indexed="10"/>"#);
+        assert_eq!(resolve_color(&color, &theme), Some(0xFF0000));
+    }
+
+    #[test]
+    fn a_cell_with_a_fill_but_no_text_is_kept() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="1"/><c r="B1" s="1" t="inlineStr"><is><t>标题</t></is></c></row>
+            <row r="2"><c r="A2" s="0" t="inlineStr"><is><t>1</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let styles = styles();
+        let sheet = parse_sheet("表一", xml, &[], &styles, false);
+
+        let empty = sheet.cell(0, 0).expect("the shaded empty cell is kept");
+        assert_eq!(empty.text, "", "it still holds no text");
+        assert_eq!(empty.style, 1);
+        assert_eq!(sheet.cell(0, 1).map(|cell| cell.text.as_str()), Some("标题"));
+        // A cell with nothing to show and nothing to paint stays out of the model.
+        assert_eq!(sheet.row_count(), 2);
+        assert_eq!(sheet.column_count(), 2);
+    }
+
+    #[test]
+    fn a_gradient_fill_takes_its_first_stop() {
+        let fill = root(r#"<fill><gradientFill type="linear">
+            <stop position="0"><color indexed="6"/></stop>
+            <stop position="1"><color indexed="4"/></stop>
+        </gradientFill></fill>"#);
+        assert_eq!(fill_of(&fill, &Theme::fallback()), Some(0xFF00FF));
+    }
 }

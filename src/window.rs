@@ -10,7 +10,6 @@ use std::rc::Rc;
 use gpui_kit::component::{Theme, ThemeMode, TitleBar, scroll::ScrollbarMode};
 use gpui_kit::*;
 
-use crate::loader::{DocumentKind, LoadedContent, load_document};
 use crate::settings::{ReadingBackground, Store};
 use crate::{PoemReader, file_name_of};
 
@@ -77,17 +76,18 @@ pub(crate) fn apply_theme_mode(background: ReadingBackground, cx: &mut App) {
 }
 
 /// Prefer the file passed on the command line, then the file read last session.
-fn resolve_initial_document(store: &Store) -> Option<(PathBuf, DocumentKind, LoadedContent)> {
+///
+/// Only the path is resolved here: reading and laying the file out happens
+/// after the window is up, so a large document never delays the first frame.
+fn resolve_initial_path(store: &Store) -> Option<PathBuf> {
     if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from)
-        && let Ok((kind, content)) = load_document(&path)
+        && path.is_file()
     {
-        return Some((path, kind, content));
+        return Some(path);
     }
 
     let path = store.settings().last_file.clone()?;
-    load_document(&path)
-        .ok()
-        .map(|(kind, content)| (path, kind, content))
+    path.is_file().then_some(path)
 }
 
 /// 建立应用、打开主窗口并挂上退出时的保存逻辑。
@@ -96,9 +96,9 @@ pub(crate) fn run() {
 
     let store = Rc::new(RefCell::new(Store::load()));
     let latest_position = Rc::new(Cell::new(None::<f32>));
-    let initial = resolve_initial_document(&store.borrow());
+    let initial = resolve_initial_path(&store.borrow());
     let initial_title = match initial.as_ref() {
-        Some((path, _, _)) => format!("PoemReader — {}", file_name_of(path)),
+        Some(path) => format!("PoemReader — {}", file_name_of(path)),
         None => String::from("PoemReader"),
     };
     let initial_background = store.borrow().settings().background;
@@ -110,7 +110,7 @@ pub(crate) fn run() {
         apply_theme_mode(initial_background, cx);
 
         let bounds = initial_window_bounds(cx);
-        let _ = open_window(
+        let reader = open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(560.), px(420.))),
@@ -120,14 +120,22 @@ pub(crate) fn run() {
             {
                 let store = store.clone();
                 let latest_position = latest_position.clone();
+                let initial = initial.clone();
                 move |window, cx| {
                     window.set_window_title(&initial_title);
-                    let font = window.text_style().font();
-                    cx.new(move |cx| PoemReader::new(store, latest_position, initial, font, cx))
+                    // The file is read — and a long one wrapped — after the
+                    // window is up, so it never delays the first frame.
+                    cx.new(move |cx| PoemReader::new(store, latest_position, initial, cx))
                 }
             },
         )
         .expect("failed to open the PoemReader window");
+
+        // Ask the default printer for its paper now, so the first preview has
+        // the page size ready instead of waiting on the driver.
+        cx.background_executor()
+            .spawn(async { crate::preview::warm_paper() })
+            .detach();
 
         // Closing the window with its close button removes it without running
         // the app-quit handlers, so persist the latest reading position here
@@ -135,7 +143,8 @@ pub(crate) fn run() {
         // the application, hence the subscription is intentionally leaked.
         let close_store = store.clone();
         let close_position = latest_position.clone();
-        let subscription = cx.on_window_closed(move |_cx, _window_id| {
+        let reader_id = reader.0.window_id();
+        let subscription = cx.on_window_closed(move |cx, window_id| {
             let mut store = close_store.borrow_mut();
             if let Some(position) = close_position.get()
                 && let Some(path) = store.settings().last_file.clone()
@@ -143,6 +152,17 @@ pub(crate) fn run() {
                 store.set_position(&path, position);
             }
             store.save();
+            drop(store);
+
+            // The preview is a companion window: once the reader is gone it has
+            // nothing left to show, and the application can shut down.
+            if window_id == reader_id {
+                for handle in cx.windows() {
+                    handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            }
         });
         std::mem::forget(subscription);
     });

@@ -18,15 +18,14 @@ use windows::Win32::Graphics::Gdi::{
     DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_QUALITY, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
     DT_BOTTOM, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
     DT_WORDBREAK, DeleteObject, DrawTextW, FillRect, FrameRect, GetStockObject,
-    GetTextExtentExPointW, GetTextExtentPoint32W, HBRUSH, HDC, HFONT, HGDIOBJ, IntersectClipRect,
-    OUT_DEFAULT_PRECIS, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor,
-    StretchDIBits, TRANSPARENT, TextOutW,
+    GetTextExtentExPointW, GetTextExtentPoint32W, HALFTONE, HBRUSH, HDC, HFONT, HGDIOBJ,
+    IntersectClipRect, OUT_DEFAULT_PRECIS, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, TRANSPARENT, TextOutW,
 };
-use windows::Win32::Storage::Xps::{EndPage, StartPage};
 use windows::core::PCWSTR;
 
 use crate::excel::{self, Workbook};
-use crate::print::{PageRange, PrintSummary};
+use crate::print::{Device, ImagePrint, LayoutOutcome, PageRange, PrintFit, PrintSummary};
 use crate::word;
 
 thread_local! {
@@ -53,7 +52,7 @@ impl Drop for DrawingGuard {
 }
 
 /// Margin around the printed content, in inches.
-const MARGIN_INCHES: f32 = 0.5;
+pub(crate) const MARGIN_INCHES: f32 = 0.5;
 /// Space between a table cell's border and its text, in points.
 const CELL_PADDING_PT: f32 = 4.0;
 const BOLD_WEIGHT: i32 = 700;
@@ -64,16 +63,23 @@ const LINE_COLOR: u32 = 0x808080;
 // ------------------------------------------------------------------ documents
 
 /// Print a Word document at the page width declared in the file.
+///
+/// `stop_after` is the last page a preview needs; the rest of the document is
+/// then left unmeasured, which is what makes a long document open at once.
+#[allow(clippy::too_many_arguments)]
 pub fn print_word(
-    hdc: HDC,
+    device: &mut Device,
     document: &word::WordDocument,
     width: i32,
     height: i32,
     dpi_x: i32,
     dpi_y: i32,
     range: &PageRange,
-) -> Result<PrintSummary, String> {
+    stop_after: Option<usize>,
+    fit_mode: PrintFit,
+) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
+    let hdc = device.hdc();
     let margin_x = dpi_x as f32 * MARGIN_INCHES;
     let margin_y = dpi_y as f32 * MARGIN_INCHES;
     let printable_width = width as f32 - 2.0 * margin_x;
@@ -84,21 +90,30 @@ pub fn print_word(
 
     // Points to device pixels, scaled down when the page is wider than paper.
     let natural = dpi_x as f32 / 72.0;
-    let fit = (printable_width / (document.content_width * natural)).min(1.0);
+    let fit = match fit_mode {
+        PrintFit::FitToPaper => (printable_width / (document.content_width * natural)).min(1.0),
+        PrintFit::ActualSize => 1.0,
+    };
     let scale = natural * fit;
     let column_width = document.content_width * scale;
     let left = margin_x + (printable_width - column_width) * 0.5;
 
     let mut fonts = Fonts::new(hdc, dpi_y as f32);
     let mut brushes = Brushes::default();
-    let mut pages = Pages::new(hdc, margin_y, margin_y + printable_height, range.clone());
+    let mut pages = Pages::new(
+        device,
+        margin_y,
+        margin_y + printable_height,
+        range.clone(),
+        stop_after,
+    );
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
     }
 
     let mut y = margin_y;
     for block in &document.blocks {
-        match block {
+        let more = match block {
             word::Block::Paragraph(paragraph) => {
                 let layout = layout_paragraph(hdc, &mut fonts, paragraph, column_width, scale);
                 draw_layout(
@@ -109,7 +124,7 @@ pub fn print_word(
                     &mut y,
                     column_width,
                     Some(&mut pages),
-                )?;
+                )?
             }
             word::Block::Table(table) => draw_table(
                 hdc,
@@ -122,31 +137,38 @@ pub fn print_word(
                 column_width,
                 scale,
             )?,
+        };
+        if !more {
+            break;
         }
     }
 
-    let mut summary = pages.finish()?;
-    if summary.total == 0 && range.includes(0) {
-        blank_page(hdc)?;
-        summary = PrintSummary {
+    let outcome = pages.finish()?;
+    if outcome.summary.total == 0 && range.includes(0) {
+        blank_page(device, 0)?;
+        return Ok(LayoutOutcome::whole(PrintSummary {
             printed: 1,
             total: 1,
-        };
+        }));
     }
-    Ok(summary)
+    Ok(outcome)
 }
 
 /// Print every worksheet, paginating along column and row boundaries.
+#[allow(clippy::too_many_arguments)]
 pub fn print_excel(
-    hdc: HDC,
+    device: &mut Device,
     workbook: &Workbook,
     width: i32,
     height: i32,
     dpi_x: i32,
     dpi_y: i32,
     range: &PageRange,
-) -> Result<PrintSummary, String> {
+    stop_after: Option<usize>,
+    fit_mode: PrintFit,
+) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
+    let hdc = device.hdc();
     let margin_x = dpi_x as f32 * MARGIN_INCHES;
     let margin_y = dpi_y as f32 * MARGIN_INCHES;
     let printable_width = width as f32 - 2.0 * margin_x;
@@ -156,23 +178,51 @@ pub fn print_excel(
     }
 
     // Cell geometry is in 96 dpi pixels; scale it to the printer's resolution.
-    let scale = dpi_x as f32 / 96.0;
+    let mut scale = dpi_x as f32 / 96.0;
+    if fit_mode == PrintFit::FitToPaper {
+        // A single column wider than the paper is cut at the right edge,
+        // whatever the page breaks do, so the sheet is shrunk until its widest
+        // column fits. Narrow columns still spill onto the next page by column,
+        // which loses nothing.
+        let widest = workbook
+            .sheets
+            .iter()
+            .flat_map(|sheet| sheet.column_lefts.windows(2))
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0_f32, f32::max);
+        if widest > 0.0 {
+            let room = printable_width / scale;
+            if widest > room {
+                // Never shrink past a quarter: below that a page of text stops
+                // being readable, and column pagination loses nothing anyway.
+                scale *= (room / widest).max(0.25);
+            }
+        }
+    }
     let page_width = printable_width / scale;
     let page_height = printable_height / scale;
 
     let mut fonts = Fonts::new(hdc, dpi_y as f32);
     let mut brushes = Brushes::default();
-    let mut pages = Pages::new(hdc, margin_y, margin_y + printable_height, range.clone());
+    let mut pages = Pages::new(
+        device,
+        margin_y,
+        margin_y + printable_height,
+        range.clone(),
+        stop_after,
+    );
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
     }
 
-    for sheet in &workbook.sheets {
+    'sheets: for sheet in &workbook.sheets {
         let columns = page_breaks(&sheet.column_lefts, page_width);
         let rows = page_breaks(&sheet.row_tops, page_height);
         for (column_start, column_end) in &columns {
             for (row_start, row_end) in &rows {
-                pages.new_page()?;
+                if !pages.new_page()? {
+                    break 'sheets;
+                }
                 draw_sheet_page(
                     hdc,
                     &mut fonts,
@@ -189,32 +239,37 @@ pub fn print_excel(
         }
     }
 
-    let mut summary = pages.finish()?;
-    if summary.total == 0 && range.includes(0) {
-        blank_page(hdc)?;
-        summary = PrintSummary {
+    let outcome = pages.finish()?;
+    if outcome.summary.total == 0 && range.includes(0) {
+        blank_page(device, 0)?;
+        return Ok(LayoutOutcome::whole(PrintSummary {
             printed: 1,
             total: 1,
-        };
+        }));
     }
-    Ok(summary)
+    Ok(outcome)
 }
 
-/// Print a picture on one page, scaled to fit the printable area.
+/// Print a picture: fitted to the printable area, then enlarged or reduced by
+/// the print scale, moved by its anchor, and split across pages when it is set
+/// to be put back together as a poster.
+///
+/// The scale is of the fitted size: 100% is the picture as it always printed,
+/// more shows a part of the picture at that size, less leaves a white border
+/// around it.
+#[allow(clippy::too_many_arguments)]
 pub fn print_image(
-    hdc: HDC,
+    device: &mut Device,
     pixels: &RgbaImage,
     width: i32,
     height: i32,
     dpi_x: i32,
     dpi_y: i32,
     range: &PageRange,
-) -> Result<PrintSummary, String> {
+    print: ImagePrint,
+) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
-    let total = 1;
-    if !range.includes(0) {
-        return Ok(PrintSummary { printed: 0, total });
-    }
+    let hdc = device.hdc();
 
     let margin_x = dpi_x as f32 * MARGIN_INCHES;
     let margin_y = dpi_y as f32 * MARGIN_INCHES;
@@ -224,50 +279,74 @@ pub fn print_image(
         return Err(String::from("打印机没有足够的可打印区域"));
     }
 
-    let (source_width, source_height) = pixels.dimensions();
-    if source_width == 0 || source_height == 0 {
-        blank_page(hdc)?;
-        return Ok(PrintSummary { printed: 1, total });
+    if pixels.width() == 0 || pixels.height() == 0 {
+        blank_page(device, 0)?;
+        return Ok(LayoutOutcome::whole(PrintSummary {
+            printed: 1,
+            total: 1,
+        }));
     }
 
-    let factor =
-        (printable_width / source_width as f32).min(printable_height / source_height as f32);
-    let target_width = (source_width as f32 * factor).max(1.0);
-    let target_height = (source_height as f32 * factor).max(1.0);
-    let x = margin_x + (printable_width - target_width) * 0.5;
-    let y = margin_y + (printable_height - target_height) * 0.5;
-
-    start_page(hdc)?;
-    draw_rgba(
-        hdc,
-        &flatten_on_white(pixels),
-        x,
-        y,
-        target_width,
-        target_height,
+    let layout = crate::print::image_layout(
+        pixels.dimensions(),
+        (printable_width, printable_height),
+        print,
     );
-    end_page(hdc)?;
+    let total = layout.tiles.0 * layout.tiles.1;
+    // A poster hands the same picture to every page; converting it out of RGBA
+    // once keeps that from being paid per page.
+    let Some(dib) = Dib::new(pixels) else {
+        return Err(String::from("无法读取这张图片"));
+    };
+    let anchor = print.anchor.clamped();
 
-    Ok(PrintSummary { printed: 1, total })
-}
+    let mut printed = 0;
+    for index in 0..total {
+        if !range.includes(index) {
+            continue;
+        }
+        let column = index % layout.tiles.0;
+        let row = index / layout.tiles.0;
+        let (x, y) = if print.poster {
+            // Every page is the same picture, moved one page up and to the
+            // left: page 1 holds the top left corner of the picture.
+            (
+                margin_x - column as f32 * printable_width,
+                margin_y - row as f32 * printable_height,
+            )
+        } else {
+            // 画面比纸小就居中留白；比纸大就把溢出的部分按基准点挪开，基准点
+            // 在 0.5 时刚好是居中。
+            crate::print::image_origin(
+                (margin_x, margin_y, printable_width, printable_height),
+                layout,
+                anchor,
+            )
+        };
 
-fn blank_page(hdc: HDC) -> Result<(), String> {
-    start_page(hdc)?;
-    end_page(hdc)
-}
-
-fn start_page(hdc: HDC) -> Result<(), String> {
-    if unsafe { StartPage(hdc) } <= 0 {
-        return Err(String::from("无法开始打印页面"));
+        device.start_page(index)?;
+        // An enlarged picture reaches past the printable area, where the
+        // printer cannot lay down ink; the page edge is where it stops, which
+        // is what the preview shows as well.
+        let clip = Clip::new(
+            hdc,
+            margin_x,
+            margin_y,
+            margin_x + printable_width,
+            margin_y + printable_height,
+        );
+        dib.blit(hdc, x, y, layout.drawn.0, layout.drawn.1);
+        drop(clip);
+        device.end_page(index)?;
+        printed += 1;
     }
-    Ok(())
+
+    Ok(LayoutOutcome::whole(PrintSummary { printed, total }))
 }
 
-fn end_page(hdc: HDC) -> Result<(), String> {
-    if unsafe { EndPage(hdc) } <= 0 {
-        return Err(String::from("写入打印页面失败"));
-    }
-    Ok(())
+fn blank_page(device: &mut Device, index: usize) -> Result<(), String> {
+    device.start_page(index)?;
+    device.end_page(index)
 }
 
 // --------------------------------------------------------------------- pages
@@ -275,24 +354,33 @@ fn end_page(hdc: HDC) -> Result<(), String> {
 /// Opens pages as content fills them.
 ///
 /// Every page is laid out, but only the pages selected by `range` are opened on
-/// the printer; the others advance the layout with drawing switched off.
-struct Pages {
-    hdc: HDC,
+/// the device; the others advance the layout with drawing switched off.
+struct Pages<'a> {
+    device: &'a mut Device,
     top: f32,
     bottom: f32,
     open: bool,
     drawing: bool,
     /// Pages laid out so far.
     index: usize,
-    /// Pages sent to the printer.
+    /// Pages painted.
     printed: usize,
     range: PageRange,
+    /// Highest page that may be opened; the layout quits beyond it.
+    stop_after: Option<usize>,
+    stopped: bool,
 }
 
-impl Pages {
-    fn new(hdc: HDC, top: f32, bottom: f32, range: PageRange) -> Self {
+impl<'a> Pages<'a> {
+    fn new(
+        device: &'a mut Device,
+        top: f32,
+        bottom: f32,
+        range: PageRange,
+        stop_after: Option<usize>,
+    ) -> Self {
         Self {
-            hdc,
+            device,
             top,
             bottom,
             open: false,
@@ -300,20 +388,30 @@ impl Pages {
             index: 0,
             printed: 0,
             range,
+            stop_after,
+            stopped: false,
         }
     }
 
-    fn new_page(&mut self) -> Result<(), String> {
+    /// Open the next page. False means the layout asked to stop.
+    fn new_page(&mut self) -> Result<bool, String> {
+        if let Some(stop) = self.stop_after
+            && self.index > stop
+        {
+            self.stopped = true;
+            return Ok(false);
+        }
         self.close()?;
+        let index = self.index;
         self.open = true;
-        self.drawing = self.range.includes(self.index);
+        self.drawing = self.range.includes(index);
         self.index += 1;
         if self.drawing {
-            start_page(self.hdc)?;
+            self.device.start_page(index)?;
             self.printed += 1;
         }
         set_drawing(self.drawing);
-        Ok(())
+        Ok(true)
     }
 
     fn close(&mut self) -> Result<(), String> {
@@ -324,7 +422,7 @@ impl Pages {
         if self.drawing {
             self.drawing = false;
             set_drawing(true);
-            end_page(self.hdc)?;
+            self.device.end_page(self.index - 1)?;
         }
         Ok(())
     }
@@ -332,29 +430,36 @@ impl Pages {
     /// Make sure `height` fits below `y`, starting a page when needed.
     ///
     /// A block taller than the page keeps its own page instead of being pushed
-    /// to a fresh one for ever.
-    fn ensure(&mut self, y: &mut f32, height: f32) -> Result<(), String> {
+    /// to a fresh one for ever. False means the layout asked to stop.
+    fn ensure(&mut self, y: &mut f32, height: f32) -> Result<bool, String> {
         if !self.open {
-            self.new_page()?;
+            if !self.new_page()? {
+                return Ok(false);
+            }
             *y = self.top;
-            return Ok(());
+            return Ok(true);
         }
         if *y > self.top + 0.5 && *y + height > self.bottom && height < self.height() {
-            self.new_page()?;
+            if !self.new_page()? {
+                return Ok(false);
+            }
             *y = self.top;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn height(&self) -> f32 {
         self.bottom - self.top
     }
 
-    fn finish(&mut self) -> Result<PrintSummary, String> {
+    fn finish(&mut self) -> Result<LayoutOutcome, String> {
         self.close()?;
-        Ok(PrintSummary {
-            printed: self.printed,
-            total: self.index,
+        Ok(LayoutOutcome {
+            summary: PrintSummary {
+                printed: self.printed,
+                total: self.index,
+            },
+            complete: !self.stopped,
         })
     }
 }
@@ -606,6 +711,7 @@ fn layout_paragraph(
         line: Line::default(),
         rest_width,
         limit: first_width,
+        content_width: width.max(24.0),
         first_line: true,
         first_indent,
     };
@@ -677,6 +783,8 @@ struct Flow<'a> {
     line: Line,
     rest_width: f32,
     limit: f32,
+    /// Width of the whole text column, which a picture may never exceed.
+    content_width: f32,
     first_line: bool,
     first_indent: f32,
 }
@@ -762,14 +870,26 @@ impl Flow<'_> {
             self.first_line = false;
             self.limit = self.rest_width;
         }
+        let mut width = (image.width * scale).max(1.0);
+        let mut height = (image.height * scale).max(1.0);
+        // A picture wider than the column used to run past the right margin and
+        // be cut off at the edge of the paper, which is what made a stray wide
+        // picture look broken in the preview. Shrinking it to the column keeps
+        // the whole picture on the page, in proportion.
+        if width > self.content_width {
+            height *= self.content_width / width;
+            width = self.content_width;
+        }
         self.items.push(Item::Image {
             pixels: image.pixels.clone(),
-            width: (image.width * scale).max(1.0),
-            height: (image.height * scale).max(1.0),
+            width,
+            height,
         });
     }
 }
 
+/// Draw one laid-out paragraph. False means the page layout asked to stop, so
+/// the caller must not draw anything below it.
 fn draw_layout(
     hdc: HDC,
     brushes: &mut Brushes,
@@ -778,7 +898,7 @@ fn draw_layout(
     y: &mut f32,
     width: f32,
     mut pages: Option<&mut Pages>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     *y += layout.space_before;
 
     let last_item = layout.items.len().saturating_sub(1);
@@ -786,8 +906,10 @@ fn draw_layout(
         let content_width = (width - layout.indent).max(0.0);
         match item {
             Item::Line { line, indent } => {
-                if let Some(pages) = pages.as_deref_mut() {
-                    pages.ensure(y, layout.line_height)?;
+                if let Some(pages) = pages.as_deref_mut()
+                    && !pages.ensure(y, layout.line_height)?
+                {
+                    return Ok(false);
                 }
                 let offset = alignment_offset(layout.align, content_width, line.width);
                 let mut cursor = x + layout.indent + indent + offset;
@@ -826,8 +948,10 @@ fn draw_layout(
                 width: image_width,
                 height: image_height,
             } => {
-                if let Some(pages) = pages.as_deref_mut() {
-                    pages.ensure(y, *image_height)?;
+                if let Some(pages) = pages.as_deref_mut()
+                    && !pages.ensure(y, *image_height)?
+                {
+                    return Ok(false);
                 }
                 let offset = alignment_offset(layout.align, content_width, *image_width);
                 draw_rgba(
@@ -844,7 +968,7 @@ fn draw_layout(
     }
 
     *y += layout.space_after;
-    Ok(())
+    Ok(true)
 }
 
 fn alignment_offset(align: word::Align, width: f32, content: f32) -> f32 {
@@ -917,10 +1041,10 @@ fn draw_table(
     y: &mut f32,
     available: f32,
     scale: f32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let widths = column_widths(table, available, scale);
     if widths.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let padding = (CELL_PADDING_PT * scale).max(2.0);
 
@@ -968,7 +1092,9 @@ fn draw_table(
             .map(|cell| cell.height)
             .fold(0.0_f32, f32::max)
             .max(2.0 * padding);
-        pages.ensure(y, row_height)?;
+        if !pages.ensure(y, row_height)? {
+            return Ok(false);
+        }
 
         let mut cell_x = x;
         for cell in &cells {
@@ -988,7 +1114,8 @@ fn draw_table(
             };
             let mut cell_y = *y + padding;
             for paragraph in &cell.paragraphs {
-                draw_layout(
+                // Cells are drawn whole; only the table row itself paginates.
+                let _ = draw_layout(
                     hdc,
                     brushes,
                     paragraph,
@@ -1009,7 +1136,7 @@ fn draw_table(
         *y += row_height;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 struct CellLayout {
@@ -1116,6 +1243,19 @@ fn draw_sheet_page(
     let column_count = sheet.column_count();
     let padding = (3.0 * scale).max(1.0);
 
+    draw_grid(
+        hdc,
+        brushes,
+        sheet,
+        origin_x,
+        origin_y,
+        scale,
+        x_offset,
+        y_offset,
+        rows,
+        columns,
+    );
+
     let first = sheet
         .rows
         .partition_point(|row| (row.index as usize) < row_start);
@@ -1215,6 +1355,53 @@ enum Side {
     Right,
 }
 
+/// The pale grid Excel shows behind cells that carry no border of their own.
+///
+/// Without it a sheet whose cells are only shaded — or whose empty cells hold
+/// nothing but a border — printed as a few floating lines with the rest of the
+/// table missing, while the same sheet is ruled edge to edge on screen.
+const GRID_COLOR: u32 = 0xD9D9D9;
+
+/// Rule one page of a sheet, before the cells are painted on top of it.
+#[allow(clippy::too_many_arguments)]
+fn draw_grid(
+    hdc: HDC,
+    brushes: &mut Brushes,
+    sheet: &excel::Sheet,
+    origin_x: f32,
+    origin_y: f32,
+    scale: f32,
+    x_offset: f32,
+    y_offset: f32,
+    rows: (usize, usize),
+    columns: (usize, usize),
+) {
+    let (row_start, row_end) = rows;
+    let (column_start, column_end) = columns;
+    let row_end = row_end.min(sheet.row_count());
+    let column_end = column_end.min(sheet.column_count());
+    if row_start >= row_end || column_start >= column_end {
+        return;
+    }
+
+    let thickness = (scale * 0.75).max(1.0);
+    let left = origin_x;
+    let top = origin_y;
+    let right = origin_x + (sheet.column_lefts[column_end] - x_offset) * scale;
+    let bottom = origin_y + (sheet.row_tops[row_end] - y_offset) * scale;
+
+    // The closing edges are drawn as well, so a table whose last row or column
+    // has no cells of its own still ends in a line.
+    for row in row_start..=row_end {
+        let y = origin_y + (sheet.row_tops[row] - y_offset) * scale;
+        fill_rect(hdc, brushes, left, y, right - left, thickness, GRID_COLOR);
+    }
+    for column in column_start..=column_end {
+        let x = origin_x + (sheet.column_lefts[column] - x_offset) * scale;
+        fill_rect(hdc, brushes, x, top, thickness, bottom - top, GRID_COLOR);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_cell_text(
     hdc: HDC,
@@ -1227,7 +1414,7 @@ fn draw_cell_text(
     height: f32,
     padding: f32,
 ) {
-    if !drawing() {
+    if !drawing() || cell.text.is_empty() {
         return;
     }
     let size_pt = style.map(|style| style.size).unwrap_or(15.0) * 72.0 / 96.0;
@@ -1317,64 +1504,447 @@ fn frame_rect(hdc: HDC, brushes: &mut Brushes, x: f32, y: f32, width: f32, heigh
     let _ = unsafe { FrameRect(hdc, &rect, brush) };
 }
 
-/// Replace transparent pixels with white, so the paper shows the same picture
-/// the reader sees instead of the black that `StretchDIBits` would draw.
-fn flatten_on_white(image: &RgbaImage) -> RgbaImage {
-    let mut flat = image.clone();
-    let data: &mut [u8] = &mut flat;
-    for pixel in data.as_chunks_mut::<4>().0 {
-        let alpha = pixel[3] as u32;
-        if alpha == 255 {
-            continue;
+/// Keeps drawing inside a rectangle for as long as it lives.
+///
+/// The device context is shared by a whole page, so the cut-out is dropped
+/// again before anything else is painted on it.
+struct Clip {
+    hdc: HDC,
+    saved: i32,
+}
+
+impl Clip {
+    fn new(hdc: HDC, left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        let saved = unsafe { SaveDC(hdc) };
+        // Without a saved state there is nothing to restore the cut-out with,
+        // so the clip is skipped rather than left on the context for good.
+        if saved != 0 {
+            unsafe {
+                IntersectClipRect(
+                    hdc,
+                    left.round() as i32,
+                    top.round() as i32,
+                    right.round() as i32,
+                    bottom.round() as i32,
+                );
+            }
         }
-        for channel in &mut pixel[..3] {
-            *channel = ((*channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
-        }
-        pixel[3] = 255;
+        Self { hdc, saved }
     }
-    flat
+}
+
+impl Drop for Clip {
+    fn drop(&mut self) {
+        if self.saved != 0 {
+            let _ = unsafe { RestoreDC(self.hdc, self.saved) };
+        }
+    }
 }
 
 fn draw_rgba(hdc: HDC, image: &RgbaImage, x: f32, y: f32, width: f32, height: f32) {
-    let (source_width, source_height) = image.dimensions();
-    if !drawing() || source_width == 0 || source_height == 0 || width < 1.0 || height < 1.0 {
+    if !drawing() {
         return;
     }
+    if let Some(dib) = Dib::new(image) {
+        dib.blit(hdc, x, y, width, height);
+    }
+}
 
-    // `StretchDIBits` expects BGRA with rows from the top down.
-    let mut data = image.as_raw().clone();
-    for pixel in data.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
+/// A picture converted once into the bitmap `StretchDIBits` wants.
+///
+/// The conversion is the expensive part of drawing a picture, and a poster
+/// print hands the same picture to every page, so it is done once and blitted
+/// as often as needed.
+struct Dib {
+    data: Vec<u8>,
+    info: BITMAPINFO,
+    width: i32,
+    height: i32,
+}
+
+impl Dib {
+    fn new(image: &RgbaImage) -> Option<Self> {
+        let (width, height) = image.dimensions();
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        // `StretchDIBits` reads a 32-bit `BI_RGB` bitmap as BGRA and ignores
+        // the alpha byte, so a transparent pixel would be drawn as the colour
+        // hiding behind it — usually black. Compositing over white here lets
+        // the paper show through, which is what the reader sees, and gives the
+        // bytes the order the call expects in the same pass.
+        let mut data = Vec::with_capacity(image.as_raw().len());
+        for pixel in image.as_raw().as_chunks::<4>().0 {
+            let alpha = pixel[3] as u32;
+            let over_white = |channel: u8| {
+                ((channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+            };
+            data.extend_from_slice(&[
+                over_white(pixel[2]),
+                over_white(pixel[1]),
+                over_white(pixel[0]),
+                255,
+            ]);
+        }
+
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        Some(Self {
+            data,
+            info,
+            width: width as i32,
+            height: height as i32,
+        })
     }
 
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: source_width as i32,
-            biHeight: -(source_height as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0, // BI_RGB
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    fn blit(&self, hdc: HDC, x: f32, y: f32, width: f32, height: f32) {
+        if !drawing() || width < 1.0 || height < 1.0 {
+            return;
+        }
 
-    let _ = unsafe {
-        StretchDIBits(
+        // The default stretch mode drops pixels instead of blending them, which
+        // turns a small picture drawn larger into sharp blocks and a large one
+        // drawn smaller into moiré. Halftone blends, and needs the brush origin
+        // reset to stay aligned with the paper.
+        unsafe {
+            SetStretchBltMode(hdc, HALFTONE);
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
+        }
+
+        let _ = unsafe {
+            StretchDIBits(
+                hdc,
+                x.round() as i32,
+                y.round() as i32,
+                width.round() as i32,
+                height.round() as i32,
+                0,
+                0,
+                self.width,
+                self.height,
+                Some(self.data.as_ptr() as *const c_void),
+                &self.info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            )
+        };
+    }
+}
+
+/// A picture is drawn through `StretchDIBits`, which knows nothing about
+/// alpha: a transparent pixel used to reach the paper as black, and a small
+/// picture scaled up used to be dropped into blocks. Both are checked here on
+/// the same off-screen sheet the preview paints onto.
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::print::{ImageScale, SheetGeometry};
+
+    /// Paint `pixels` over the whole of a small sheet and return the sheet.
+    fn paint(pixels: &RgbaImage) -> RgbaImage {
+        let geometry = SheetGeometry::without_margins(40, 40);
+        let mut device = Device::sheet(geometry).expect("sheet");
+        let hdc = device.hdc();
+        device.start_page(0).expect("start");
+        draw_rgba(hdc, pixels, 0.0, 0.0, 40.0, 40.0);
+        device.end_page(0).expect("end");
+        let pages = device.into_pages();
+        pages.first().expect("one page").1.clone()
+    }
+
+    #[test]
+    fn a_transparent_picture_keeps_the_paper_white() {
+        let clear = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
+        let sheet = paint(&clear);
+
+        // Blue first: the sheet is read back in texture order.
+        assert_eq!(sheet.get_pixel(20, 20).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn a_picture_keeps_its_colours_when_scaled() {
+        let red = RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let sheet = paint(&red);
+
+        let pixel = sheet.get_pixel(20, 20).0;
+        assert_eq!(pixel, [0, 0, 255, 255], "a red picture prints red");
+    }
+
+    /// Two columns and two rows of twenty pixels, with `cells` placed on it.
+    fn sheet(cells: Vec<(u32, u32, usize, &str)>) -> excel::Sheet {
+        let mut rows: Vec<excel::SheetRow> = Vec::new();
+        let mut cells = cells;
+        cells.sort_by_key(|(row, column, _, _)| (*row, *column));
+        for (row, column, style, text) in cells {
+            let cell = excel::Cell {
+                column,
+                text: text.to_string(),
+                style,
+                numeric: false,
+            };
+            match rows.last_mut() {
+                Some(entry) if entry.index == row => entry.cells.push(cell),
+                _ => rows.push(excel::SheetRow {
+                    index: row,
+                    cells: vec![cell],
+                }),
+            }
+        }
+        excel::Sheet {
+            name: String::from("Sheet1"),
+            column_lefts: vec![0.0, 20.0, 40.0],
+            row_tops: vec![0.0, 20.0, 40.0],
+            rows,
+            merges: Vec::new(),
+        }
+    }
+
+    /// Paint the whole sheet as one page, at one device pixel per sheet pixel.
+    fn sheet_page(sheet: &excel::Sheet, styles: &[excel::CellStyle]) -> RgbaImage {
+        let geometry = SheetGeometry::without_margins(40, 40);
+        let mut device = Device::sheet(geometry).expect("sheet");
+        let hdc = device.hdc();
+        device.start_page(0).expect("start");
+        let mut fonts = Fonts::new(hdc, 96.0);
+        let mut brushes = Brushes::default();
+        draw_sheet_page(
             hdc,
-            x.round() as i32,
-            y.round() as i32,
-            width.round() as i32,
-            height.round() as i32,
-            0,
-            0,
-            source_width as i32,
-            source_height as i32,
-            Some(data.as_ptr() as *const c_void),
-            &info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
+            &mut fonts,
+            &mut brushes,
+            sheet,
+            styles,
+            0.0,
+            0.0,
+            1.0,
+            (0, 2),
+            (0, 2),
+        );
+        device.end_page(0).expect("end");
+        let pages = device.into_pages();
+        pages.first().expect("one page").1.clone()
+    }
+
+    #[test]
+    fn a_shaded_cell_without_text_prints_its_fill() {
+        let styles = vec![
+            excel::CellStyle::default(),
+            excel::CellStyle {
+                fill: Some(0xFF0000),
+                ..Default::default()
+            },
+        ];
+        let sheet = sheet(vec![(0, 0, 1, ""), (1, 1, 0, "值")]);
+        let page = sheet_page(&sheet, &styles);
+
+        // Texture order: blue first, so red reads back as [0, 0, 255, 255].
+        assert_eq!(page.get_pixel(5, 5).0, [0, 0, 255, 255], "the fill is painted");
+        assert_eq!(page.get_pixel(30, 5).0, [255, 255, 255, 255], "its neighbour is not");
+    }
+
+    #[test]
+    fn a_sheet_without_borders_still_prints_its_grid() {
+        let styles = vec![excel::CellStyle::default()];
+        let sheet = sheet(vec![(0, 0, 0, "值")]);
+        let page = sheet_page(&sheet, &styles);
+
+        let grid = [0xD9u8, 0xD9, 0xD9, 255];
+        assert_eq!(page.get_pixel(30, 30).0, [255, 255, 255, 255], "cells stay white");
+        assert_eq!(page.get_pixel(30, 20).0, grid, "the row line runs to the right edge");
+        assert_eq!(page.get_pixel(20, 30).0, grid, "the column line runs down the page");
+        assert_eq!(page.get_pixel(30, 0).0, grid, "the top edge is ruled");
+    }
+
+    /// Print a picture on a 300 × 300 sheet and read the pages back. At 96 dpi
+    /// the margins are 48 px, so the printable area is the 204 px square in the
+    /// middle.
+    fn print_pictures(pixels: &RgbaImage, print: ImagePrint) -> Vec<RgbaImage> {
+        let geometry = SheetGeometry::without_margins(300, 300);
+        let mut device = Device::sheet(geometry).expect("sheet");
+        print_image(&mut device, pixels, 300, 300, 96, 96, &PageRange::All, print).expect("print");
+        device
+            .into_pages()
+            .into_iter()
+            .map(|(_, page)| page)
+            .collect()
+    }
+
+    /// The first page of a picture printed at `scale`.
+    fn print_picture(pixels: &RgbaImage, scale: ImageScale) -> RgbaImage {
+        print_pictures(
+            pixels,
+            ImagePrint {
+                scale,
+                ..Default::default()
+            },
         )
-    };
+        .into_iter()
+        .next()
+        .expect("one page")
+    }
+
+    fn red_square() -> RgbaImage {
+        RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]))
+    }
+
+    /// Red on the left half, blue on the right, to see which part is printed.
+    fn two_halves() -> RgbaImage {
+        RgbaImage::from_fn(20, 20, |x, _| {
+            if x < 10 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        })
+    }
+
+    // Texture order: blue first, so red reads back as [0, 0, 255, 255] and
+    // blue as [255, 0, 0, 255].
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const PAPER: [u8; 4] = [255, 255, 255, 255];
+
+    #[test]
+    fn a_picture_at_a_hundred_percent_fills_the_printable_area() {
+        let page = print_picture(&red_square(), ImageScale::default());
+
+        assert_eq!(page.get_pixel(150, 150).0, RED, "the middle is painted");
+        assert_eq!(page.get_pixel(50, 150).0, RED, "so is the printable edge");
+        assert_eq!(page.get_pixel(20, 150).0, PAPER, "the margin is not");
+    }
+
+    #[test]
+    fn a_smaller_picture_sits_in_the_middle_of_a_white_page() {
+        let page = print_picture(&red_square(), ImageScale::ALL[1]);
+
+        assert_eq!(page.get_pixel(150, 150).0, RED, "the middle is painted");
+        assert_eq!(page.get_pixel(60, 150).0, PAPER, "half size leaves a border");
+    }
+
+    #[test]
+    fn an_enlarged_picture_stops_at_the_printable_edge() {
+        let page = print_picture(&red_square(), ImageScale::ALL[6]);
+
+        assert_eq!(page.get_pixel(150, 150).0, RED, "the middle is painted");
+        assert_eq!(
+            page.get_pixel(20, 150).0,
+            PAPER,
+            "an oversized picture is cut at the margin instead of bleeding into it"
+        );
+    }
+
+    #[test]
+    fn a_scaled_picture_is_still_one_page() {
+        for scale in ImageScale::ALL {
+            let pages = print_pictures(
+                &red_square(),
+                ImagePrint {
+                    scale,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(pages.len(), 1, "{scale:?} 不该多出页来");
+        }
+    }
+
+    #[test]
+    fn the_anchor_picks_which_part_of_an_enlarged_picture_is_printed() {
+        // Twice the paper: the printable area shows exactly half the picture,
+        // and the anchor says which half.
+        let at = |x: f32| {
+            print_picture_anchored(ImagePrint {
+                scale: ImageScale::ALL[5],
+                anchor: crate::print::ImageAnchor { x, y: 0.5 },
+                poster: false,
+            })
+        };
+
+        assert_eq!(at(0.0).get_pixel(150, 150).0, RED, "the left edge shows the left half");
+        assert_eq!(at(1.0).get_pixel(150, 150).0, BLUE, "the right edge shows the right half");
+        // 居中时接缝正好落在纸的中间，往左一点还是红的左半，往右一点是右半。
+        let centered = at(0.5);
+        assert_eq!(centered.get_pixel(100, 150).0, RED, "左半边");
+        assert_eq!(centered.get_pixel(200, 150).0, BLUE, "右半边");
+    }
+
+    fn print_picture_anchored(print: ImagePrint) -> RgbaImage {
+        print_pictures(&two_halves(), print)
+            .into_iter()
+            .next()
+            .expect("one page")
+    }
+
+    #[test]
+    fn the_anchor_does_not_move_a_picture_that_already_fits() {
+        // At full size there is nothing outside the paper to move in, so the
+        // picture stays centred whatever the anchor says.
+        let print = ImagePrint {
+            anchor: crate::print::ImageAnchor { x: 0.0, y: 0.0 },
+            ..Default::default()
+        };
+        let page = print_pictures(&two_halves(), print)
+            .into_iter()
+            .next()
+            .expect("one page");
+        // 铺满整页：左半在左，右半在右，接缝在正中。
+        assert_eq!(page.get_pixel(80, 150).0, RED, "左半边");
+        assert_eq!(page.get_pixel(220, 150).0, BLUE, "右半边");
+    }
+
+    #[test]
+    fn a_poster_print_splits_the_picture_across_pages() {
+        // Three times the paper: a 3 by 3 grid of pages, each painted right to
+        // its edge, and the whole picture is covered.
+        let pages = print_pictures(
+            &red_square(),
+            ImagePrint {
+                scale: ImageScale::ALL[6],
+                poster: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(pages.len(), 9, "300% is three pages across and three down");
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(page.get_pixel(150, 150).0, RED, "第 {index} 页是空的");
+            assert_eq!(page.get_pixel(50, 50).0, RED, "第 {index} 页的角没有铺满");
+        }
+    }
+
+    #[test]
+    fn a_poster_print_can_be_printed_one_page_at_a_time() {
+        let geometry = SheetGeometry::without_margins(300, 300);
+        let mut device = Device::sheet(geometry).expect("sheet");
+        let print = ImagePrint {
+            scale: ImageScale::ALL[6],
+            poster: true,
+            ..Default::default()
+        };
+        let outcome = print_image(
+            &mut device,
+            &red_square(),
+            300,
+            300,
+            96,
+            96,
+            &PageRange::Pages(vec![(2, 2)]),
+            print,
+        )
+        .expect("print");
+
+        assert_eq!(outcome.summary.total, 9, "the job still knows how many pages it has");
+        assert_eq!(outcome.summary.printed, 1, "but only the page that was asked for is painted");
+        assert_eq!(device.into_pages().len(), 1);
+    }
 }

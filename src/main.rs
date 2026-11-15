@@ -39,6 +39,7 @@ mod markdown;
 mod ooxml;
 mod pdf;
 mod picture;
+mod preview;
 mod print;
 #[cfg(windows)]
 mod print_office;
@@ -55,7 +56,11 @@ use excel::Workbook;
 use loader::{DocumentKind, LoadedContent, load_document};
 use pdf::PdfView;
 use picture::Picture;
-use print::{PrintContent, PrintJob};
+use preview::{PreviewWindow, open as open_preview_window};
+use print::{
+    ImageAnchor, ImagePrint, ImageScale, Orientation, PagesPerSheet, PrintContent, PrintFit,
+    PrintJob,
+};
 use render::excel::{ExcelRender, excel_cells};
 use render::pdf::{PdfLayout, spawn_pdf_render};
 use render::word::{WordRender, word_block};
@@ -105,7 +110,7 @@ const REWRAP_DEBOUNCE: Duration = Duration::from_millis(120);
 const SAVE_POSITION_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// The app icon, also embedded in the executable by `build.rs`.
-const APP_ICON: &[u8] = include_bytes!("../assets/icon.svg");
+pub(crate) const APP_ICON: &[u8] = include_bytes!("../assets/icon.svg");
 
 fn main() {
     window::run();
@@ -135,31 +140,7 @@ struct Document {
 }
 
 impl Document {
-    fn new(
-        path: PathBuf,
-        content: LoadedContent,
-        font: &Font,
-        font_size: Pixels,
-        line_height: f32,
-        wrap_width: f32,
-        text_system: &Arc<TextSystem>,
-    ) -> Self {
-        let content = match content {
-            LoadedContent::Text(text) => DocumentContent::Text(TextView::new(
-                Arc::new(text),
-                font,
-                font_size,
-                line_height,
-                wrap_width,
-                text_system,
-            )),
-            LoadedContent::Pdf(source) => DocumentContent::Pdf(PdfView::new(source)),
-            LoadedContent::Word(document) => DocumentContent::Word(document),
-            LoadedContent::Excel(workbook) => DocumentContent::Excel(workbook),
-            LoadedContent::Markdown(document) => DocumentContent::Markdown(document),
-            LoadedContent::Image(picture) => DocumentContent::Image(picture),
-        };
-
+    fn new(path: PathBuf, content: DocumentContent) -> Self {
         Self {
             file_name: file_name_of(&path).into(),
             path,
@@ -204,6 +185,36 @@ impl Document {
                 )
             }
         }
+    }
+}
+
+/// Turn a loaded file into what the view draws.
+///
+/// Wrapping a text file is the only part of opening a document that is
+/// proportional to its size, so callers run this on the loading thread instead
+/// of between two frames.
+fn build_content(
+    loaded: LoadedContent,
+    font: &Font,
+    font_size: Pixels,
+    line_height: f32,
+    wrap_width: f32,
+    text_system: &Arc<TextSystem>,
+) -> DocumentContent {
+    match loaded {
+        LoadedContent::Text(text) => DocumentContent::Text(TextView::new(
+            Arc::new(text),
+            font,
+            font_size,
+            line_height,
+            wrap_width,
+            text_system,
+        )),
+        LoadedContent::Pdf(source) => DocumentContent::Pdf(PdfView::new(source)),
+        LoadedContent::Word(document) => DocumentContent::Word(document),
+        LoadedContent::Excel(workbook) => DocumentContent::Excel(workbook),
+        LoadedContent::Markdown(document) => DocumentContent::Markdown(document),
+        LoadedContent::Image(picture) => DocumentContent::Image(picture),
     }
 }
 
@@ -252,6 +263,33 @@ enum PendingScroll {
     Anchor(f32),
 }
 
+/// 打开的预览窗口：视图用来避开「窗口正被借用」的限制直接驱动它，句柄用来
+/// 聚焦、关闭和比较窗口编号。
+#[derive(Clone)]
+pub(crate) struct PreviewHandle {
+    window: AnyWindowHandle,
+    view: Entity<PreviewWindow>,
+}
+
+impl PreviewHandle {
+    fn window_id(&self) -> WindowId {
+        self.window.window_id()
+    }
+
+    /// 把预览窗口带到前面；窗口已经关掉时返回 `false`。
+    fn activate(&self, cx: &mut App) -> bool {
+        self.window
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    }
+
+    fn close(&self, cx: &mut App) {
+        self.window
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
+}
+
 /// A position in the text body: a byte offset within one line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TextPos {
@@ -267,6 +305,14 @@ pub(crate) struct PoemReader {
     document: Option<Document>,
     font_size: Pixels,
     pdf_zoom: f32,
+    /// 打开着的预览窗口；预览在单独的窗口里，不占正文。
+    preview: Option<PreviewHandle>,
+    /// 打印方向。预览里改过之后，直接打印也跟着用同一方向。
+    print_orientation: Orientation,
+    /// 每张纸印几页：2 合 1、4 合 1……预览里改过之后同样带到这里。
+    pages_per_sheet: PagesPerSheet,
+    /// 图片怎么印：印多大、从画面哪一块开始、要不要拼成多页。
+    image_print: ImagePrint,
     background: ReadingBackground,
     /// What the left button does in the reading area.
     pub(crate) pointer_mode: PointerMode,
@@ -285,6 +331,11 @@ pub(crate) struct PoemReader {
     /// selection. Only the rows on screen are kept.
     row_layouts: HashMap<usize, Rc<RefCell<Option<TextLayout>>>>,
     load_task: Option<Task<()>>,
+    /// 正在读入的文件名。读大文件要几秒，这期间旧文档还留在窗口里，
+    /// 需要一句提示说明窗口没有卡死。
+    opening: Option<String>,
+    /// 窗口建好后要打开的文件，在第一帧里交给 `open_path`。
+    pending_open: Option<PathBuf>,
     save_task: Option<Task<()>>,
     /// Pending re-wrap after the window width settled.
     rewrap_task: Option<Task<()>>,
@@ -302,11 +353,12 @@ pub(crate) struct PoemReader {
 }
 
 impl PoemReader {
+    /// Build the view with nothing open yet: `initial` is read in the first
+    /// frame, so a large file never delays the window appearing.
     pub(crate) fn new(
         store: Rc<RefCell<Store>>,
         latest_position: Rc<Cell<Option<f32>>>,
-        initial: Option<(PathBuf, DocumentKind, LoadedContent)>,
-        font: Font,
+        initial: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (font_size, pdf_zoom, background, pointer_mode) = {
@@ -320,36 +372,7 @@ impl PoemReader {
             )
         };
 
-        let (document, pending_scroll) = match initial {
-            Some((path, kind, content)) => {
-                let stored = store.borrow().position_for(&path);
-                // Remember it so the next launch reopens this file even when no
-                // path was given on the command line.
-                store.borrow_mut().set_last_file(&path);
-                store.borrow().save();
-
-                let pending = match (kind, stored) {
-                    (DocumentKind::Pdf, Some(anchor)) => Some(PendingScroll::Anchor(anchor)),
-                    (DocumentKind::Pdf, None) => Some(PendingScroll::Anchor(0.0)),
-                    // Still reset the scroll area, which may be left over from
-                    // a previous document.
-                    (_, Some(offset)) => Some(PendingScroll::Offset(offset)),
-                    (_, None) => Some(PendingScroll::Offset(0.0)),
-                };
-                let document = Document::new(
-                    path,
-                    content,
-                    &font,
-                    font_size,
-                    font_size.as_f32() * LINE_HEIGHT_RATIO,
-                    text_wrap_width(TEXT_MAX_WIDTH),
-                    cx.text_system(),
-                );
-                (Some(document), pending)
-            }
-            None => (None, None),
-        };
-
+        let pending_open = initial;
         let quit_subscription = {
             let store = store.clone();
             cx.on_app_quit(move |this, _cx| {
@@ -366,9 +389,13 @@ impl PoemReader {
         let shortcut_subscription = Self::bind_shortcuts(cx);
 
         Self {
-            document,
+            document: None,
             font_size,
             pdf_zoom,
+            preview: None,
+            print_orientation: Orientation::default(),
+            pages_per_sheet: PagesPerSheet::default(),
+            image_print: ImagePrint::default(),
             background,
             pointer_mode,
             excel_sheet: 0,
@@ -378,11 +405,13 @@ impl PoemReader {
             cell_bounds: Rc::new(RefCell::new(Vec::new())),
             row_layouts: HashMap::new(),
             load_task: None,
+            opening: None,
+            pending_open,
             save_task: None,
             rewrap_task: None,
             bounds_subscription: None,
             scroll_handle: ScrollHandle::new(),
-            pending_scroll,
+            pending_scroll: None,
             interaction: None,
             latest_position,
             store,
@@ -730,48 +759,212 @@ impl PoemReader {
             window.push_notification(Notification::info("还没有可打印的文件"), cx);
             return;
         };
+        run_print_job(job, window, cx);
+    }
 
-        // Both the dialog and the spooling run off the UI thread: the dialog
-        // waits for the user and long PDFs take a while to rasterize, and the
-        // reader should stay responsive in the meantime.
-        let owner = print::foreground_owner();
-        cx.spawn_in(window, async move |view, cx| {
-            let result = cx
-                .background_spawn(async move { print::print(owner, job) })
-                .await;
+    /// 选择打印方向：记下来，并且让正开着的预览一起换过去。
+    ///
+    /// 两个窗口共用同一个方向，预览里看到的纸就是「打印…」会用的纸。
+    pub(crate) fn set_print_orientation(&mut self, orientation: Orientation, cx: &mut Context<Self>) {
+        if self.print_orientation == orientation {
+            return;
+        }
+        self.print_orientation = orientation;
+        if let Some(preview) = &self.preview {
+            // The reader entity is leased by this very update; the preview must
+            // not call back into it or GPUI panics on the double borrow.
+            preview
+                .view
+                .update(cx, |preview, cx| {
+                    preview.set_orientation_from(orientation, false, cx)
+                });
+        }
+        cx.notify();
+    }
 
-            view.update_in(cx, |_this, window, cx| match result {
-                Ok(Some(summary)) => {
-                    let notification = if summary.printed == 0 {
-                        if summary.total == 0 {
-                            Notification::info("文档没有可打印的内容")
-                        } else {
-                            Notification::info(format!(
-                                "指定范围内没有可打印的页面（文档共 {} 页）",
-                                summary.total
-                            ))
-                        }
-                    } else if summary.printed < summary.total {
-                        Notification::success(format!(
-                            "已发送 {} 页到打印机（文档共 {} 页）",
-                            summary.printed, summary.total
-                        ))
-                    } else {
-                        Notification::success(format!("已发送 {} 页到打印机", summary.printed))
-                    };
-                    window.push_notification(notification, cx);
-                }
-                Ok(None) => {}
-                Err(message) => window
-                    .push_notification(Notification::error(format!("打印失败：{message}")), cx),
-            })
-            .ok();
-        })
-        .detach();
+    /// 选择每张纸印几页：记下来，并且让正开着的预览一起换过去。
+    pub(crate) fn set_pages_per_sheet(
+        &mut self,
+        pages: PagesPerSheet,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pages_per_sheet == pages {
+            return;
+        }
+        self.pages_per_sheet = pages;
+        if let Some(preview) = &self.preview {
+            // 主窗口自己的实体正被借用着，预览不能反过来碰它。
+            preview
+                .view
+                .update(cx, |preview, cx| {
+                    preview.set_pages_per_sheet_from(pages, false, cx)
+                });
+        }
+        cx.notify();
+    }
+
+    /// 图片怎么印：记下来，并且让正开着的预览一起换过去。
+    pub(crate) fn set_image_print(&mut self, print: ImagePrint, cx: &mut Context<Self>) {
+        if self.image_print == print {
+            return;
+        }
+        self.image_print = print;
+        if let Some(preview) = &self.preview {
+            // 主窗口自己的实体正被借用着，预览不能反过来碰它。
+            preview
+                .view
+                .update(cx, |preview, cx| {
+                    preview.set_image_print_from(print, false, cx)
+                });
+        }
+        cx.notify();
+    }
+
+    /// 图片印多大，其余设置保持不变。
+    pub(crate) fn set_image_scale(&mut self, scale: ImageScale, cx: &mut Context<Self>) {
+        let print = ImagePrint {
+            scale,
+            ..self.image_print
+        };
+        self.set_image_print(print, cx);
+    }
+
+    /// 放大到一页装不下时，是否分到多页再拼起来。
+    pub(crate) fn toggle_image_poster(&mut self, cx: &mut Context<Self>) {
+        let print = ImagePrint {
+            poster: !self.image_print.poster,
+            ..self.image_print
+        };
+        self.set_image_print(print, cx);
+    }
+
+    /// 画面回到纸的中间。
+    pub(crate) fn center_image(&mut self, cx: &mut Context<Self>) {
+        let print = ImagePrint {
+            anchor: ImageAnchor::default(),
+            ..self.image_print
+        };
+        self.set_image_print(print, cx);
+    }
+
+    /// 预览窗口改了图片设置，记下来即可：消息本来就从预览发出来的。
+    pub(crate) fn remember_image_print(&mut self, print: ImagePrint, cx: &mut Context<Self>) {
+        if self.image_print == print {
+            return;
+        }
+        self.image_print = print;
+        cx.notify();
+    }
+
+    /// 预览窗口换了组合方式，记下来即可：消息本来就从预览发出来的。
+    pub(crate) fn remember_pages_per_sheet(
+        &mut self,
+        pages: PagesPerSheet,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pages_per_sheet == pages {
+            return;
+        }
+        self.pages_per_sheet = pages;
+        cx.notify();
+    }
+
+    /// 预览窗口换了方向，记下来即可：消息本来就从预览发出来的，不必再传回去。
+    pub(crate) fn remember_print_orientation(
+        &mut self,
+        orientation: Orientation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.print_orientation == orientation {
+            return;
+        }
+        self.print_orientation = orientation;
+        cx.notify();
+    }
+
+    /// 在单独的窗口里打开打印预览；已经开着就把它带到前面。
+    pub(crate) fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A preview that is still open is brought forward instead of opening a
+        // second copy of the same document.
+        if let Some(preview) = self.preview.clone() {
+            if preview.activate(cx) {
+                return;
+            }
+            self.preview = None;
+        }
+
+        let Some(job) = self.print_job() else {
+            window.push_notification(Notification::info("还没有可打印的文件"), cx);
+            return;
+        };
+        let file_name = self
+            .document
+            .as_ref()
+            .map(|document| document.file_name.to_string())
+            .unwrap_or_default();
+        // 图片文件的那张纹理已经在阅读窗口里了，预览拿着它拖动画面，比等整页
+        // 位图重画快得多。
+        let picture = match self.document.as_ref().map(|document| &document.content) {
+            Some(DocumentContent::Image(picture)) => Some(picture.image()),
+            _ => None,
+        };
+
+        match open_preview_window(
+            job,
+            picture,
+            file_name,
+            self.background,
+            cx.entity().downgrade(),
+            window,
+            cx,
+        ) {
+            // The view is what later keystrokes drive; the handle alone cannot
+            // reach it while its window is mid-update.
+            Ok((window, view)) => self.preview = Some(PreviewHandle { window, view }),
+            Err(error) => window.push_notification(
+                Notification::error(format!("无法打开预览窗口：{error}")),
+                cx,
+            ),
+        }
+    }
+
+    /// 关闭预览窗口（换文档时用，旧文档的排版已经不适用了）。
+    pub(crate) fn close_preview_window(&mut self, cx: &mut App) {
+        if let Some(preview) = self.preview.take() {
+            preview.close(cx);
+        }
+    }
+
+    /// 预览窗口已经自行关闭，忘掉它。
+    pub(crate) fn forget_preview(&mut self) {
+        self.preview = None;
+    }
+
+    /// 预览窗口的 `WindowId`，用来判断键盘事件来自哪个窗口。
+    pub(crate) fn preview_window_id(&self) -> Option<WindowId> {
+        self.preview.as_ref().map(PreviewHandle::window_id)
+    }
+
+    /// 打印预览里的那份文档。
+    pub(crate) fn print_preview(&self, window: &mut Window, cx: &mut App) {
+        if let Some(preview) = &self.preview {
+            preview
+                .view
+                .update(cx, |preview, cx| preview.print_document(window, cx));
+        }
+    }
+
+    /// 缩放预览页面的显示比例。
+    pub(crate) fn zoom_preview(&self, factor: f32, cx: &mut App) {
+        if let Some(preview) = &self.preview {
+            preview
+                .view
+                .update(cx, |preview, cx| preview.zoom_by(factor, cx));
+        }
     }
 
     /// The open document as a printable job.
-    fn print_job(&self) -> Option<PrintJob> {
+    pub(crate) fn print_job(&self) -> Option<PrintJob> {
         let document = self.document.as_ref()?;
         let content = match &document.content {
             DocumentContent::Text(text) => PrintContent::Text {
@@ -791,6 +984,12 @@ impl PoemReader {
         Some(PrintJob {
             title: document.file_name.to_string(),
             content,
+            // The reader has no print controls of its own, so it prints the way
+            // the preview does by default: nothing is cut at the page edge.
+            fit: PrintFit::FitToPaper,
+            orientation: self.print_orientation,
+            pages_per_sheet: self.pages_per_sheet,
+            image: self.image_print,
         })
     }
 
@@ -831,12 +1030,39 @@ impl PoemReader {
 
     /// Load the document at `path` in the background and show it.
     pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        // Parsing and rasterizing a PDF can take a moment, so keep it off the
-        // UI thread.
+        // Reading a file, parsing a PDF and wrapping a text file all take time
+        // proportional to its size, so they run before the view is touched —
+        // the window keeps painting the old document until the new one is
+        // ready.
         let read_path = path.clone();
+        let font = window.text_style().font();
+        let font_size = self.font_size;
+        let line_height = self.line_height();
+        let wrap_width = self.wrap_width_for(window);
+        let text_system = cx.text_system().clone();
+
+        // Reading and parsing a big file takes seconds. The old document stays
+        // on screen meanwhile, so say what is going on instead of letting the
+        // window look frozen.
+        let name = file_name_of(&path);
+        self.opening = Some(name.clone());
+        window.set_window_title(&format!("PoemReader — 正在打开 {name}…"));
+        cx.notify();
+
         self.load_task = Some(cx.spawn_in(window, async move |view, cx| {
             let loaded = cx
-                .background_spawn(async move { load_document(&read_path) })
+                .background_spawn(async move {
+                    let (kind, loaded) = load_document(&read_path)?;
+                    let content = build_content(
+                        loaded,
+                        &font,
+                        font_size,
+                        line_height,
+                        wrap_width,
+                        &text_system,
+                    );
+                    Ok::<_, String>((kind, content))
+                })
                 .await;
 
             match loaded {
@@ -860,18 +1086,13 @@ impl PoemReader {
                         this.store.borrow_mut().set_last_file(&path);
                         this.persist_settings();
 
-                        let document = Document::new(
-                            path.clone(),
-                            content,
-                            &window.text_style().font(),
-                            this.font_size,
-                            this.line_height(),
-                            this.wrap_width_for(window),
-                            cx.text_system(),
-                        );
+                        let document = Document::new(path.clone(), content);
 
                         window.set_window_title(&title);
                         this.document = Some(document);
+                        this.opening = None;
+                        // A preview of the previous file would now be wrong.
+                        this.close_preview_window(cx);
                         this.selection = None;
                         this.cell_selection = None;
                         this.interaction = None;
@@ -882,8 +1103,19 @@ impl PoemReader {
                     .ok();
                 }
                 Err(message) => {
-                    view.update_in(cx, |_, window, cx| {
+                    view.update_in(cx, move |this, window, cx| {
+                        this.opening = None;
+                        // The title was switched to the file being opened; put
+                        // the one that is still on screen back.
+                        let title = match this.document.as_ref() {
+                            Some(document) => {
+                                format!("PoemReader — {}", document.file_name)
+                            }
+                            None => String::from("PoemReader"),
+                        };
+                        window.set_window_title(&title);
                         window.push_notification(Notification::error(message), cx);
+                        cx.notify();
                     })
                     .ok();
                 }
@@ -946,7 +1178,7 @@ impl PoemReader {
         let line_height = self.line_height();
         let wrap_width = self.wrap_width_for(window);
         let font = window.text_style().font();
-        let text_system = cx.text_system();
+        let text_system = cx.text_system().clone();
 
         let Some(document) = self.document.as_mut() else {
             return;
@@ -966,7 +1198,7 @@ impl PoemReader {
             font_size,
             line_height,
             wrap_width,
-            text_system,
+            &text_system,
         );
 
         let offset = text.offset_for_source(anchor);
@@ -1170,6 +1402,13 @@ impl PoemReader {
         let font_size = self.font_size;
         let pdf_zoom = self.pdf_zoom;
         let background = self.background;
+        let orientation = self.print_orientation;
+        let self_pages = self.pages_per_sheet;
+        let image_scale = self.image_print;
+        let is_image = matches!(
+            self.document.as_ref().map(|document| &document.content),
+            Some(DocumentContent::Image(_))
+        );
         let background_color = background.background(cx);
         let foreground = background.foreground(cx);
         let zoomable = !self.is_text();
@@ -1177,6 +1416,15 @@ impl PoemReader {
             .foreground(foreground)
             .hover(foreground.opacity(0.10))
             .active(foreground.opacity(0.16));
+
+        // 菜单里的一行「N 合 1」，勾在当前的选择上。
+        let pages_item = |pages: PagesPerSheet, current: PagesPerSheet, view: Entity<Self>| {
+            PopupMenuItem::new(pages.label())
+                .checked(pages == current)
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.set_pages_per_sheet(pages, cx));
+                })
+        };
 
         let file_menu = {
             let view = view.clone();
@@ -1186,8 +1434,9 @@ impl PoemReader {
                 .label("文件")
                 .dropdown_menu(move |menu, _window, _cx| {
                     let load = view.clone();
+                    let preview = view.clone();
                     let print = view.clone();
-                    menu.min_w(px(220.))
+                    let mut menu = menu.min_w(px(220.))
                         .item(
                             PopupMenuItem::new("加载文件…")
                                 .icon(IconName::FolderOpen)
@@ -1195,15 +1444,116 @@ impl PoemReader {
                                     load.update(cx, |this, cx| this.load_file(window, cx));
                                 }),
                         )
+                        .item(
+                            PopupMenuItem::new("打印预览…")
+                                .icon(IconName::Eye)
+                                .on_click(move |_, window, cx| {
+                                    preview
+                                        .update(cx, |this, cx| this.open_preview(window, cx));
+                                }),
+                        )
                         .item(PopupMenuItem::new("打印…").on_click(move |_, window, cx| {
                             print.update(cx, |this, cx| this.print_document(window, cx));
                         }))
                         .separator()
+                        // 方向也在这里选：预览里同样可以切换，两处说的是同一件事。
                         .item(
-                            PopupMenuItem::new("退出")
-                                .icon(IconName::Close)
-                                .on_click(|_, _, cx| cx.quit()),
+                            PopupMenuItem::new("纵向打印")
+                                .checked(orientation == Orientation::Portrait)
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_print_orientation(Orientation::Portrait, cx)
+                                        });
+                                    }
+                                }),
                         )
+                        .item(
+                            PopupMenuItem::new("横向打印")
+                                .checked(orientation == Orientation::Landscape)
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_print_orientation(Orientation::Landscape, cx)
+                                        });
+                                    }
+                                }),
+                        )
+                        .separator()
+                        // 一张纸印几页：与方向一样，预览里也有同一组选项。
+                        .item(PopupMenuItem::label("每张纸打印页数"))
+                        .item(pages_item(
+                            PagesPerSheet::One,
+                            self_pages,
+                            view.clone(),
+                        ))
+                        .item(pages_item(
+                            PagesPerSheet::Two,
+                            self_pages,
+                            view.clone(),
+                        ))
+                        .item(pages_item(
+                            PagesPerSheet::Four,
+                            self_pages,
+                            view.clone(),
+                        ))
+                        .item(pages_item(
+                            PagesPerSheet::Six,
+                            self_pages,
+                            view.clone(),
+                        ))
+                        .item(pages_item(
+                            PagesPerSheet::Eight,
+                            self_pages,
+                            view.clone(),
+                        ));
+
+                    // 图片没有版式，能缩放的只有画面本身，所以这一组只在看图
+                    // 时出现。
+                    if is_image {
+                        menu = menu
+                            .separator()
+                            .item(PopupMenuItem::label("图片打印缩放"));
+                        for scale in ImageScale::ALL {
+                            let view = view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(scale.label())
+                                    .checked(scale == image_scale.scale)
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_image_scale(scale, cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        // 放大到一页装不下时，把画面分到多页上，拼起来就是原图。
+                        menu = menu
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("拼接分页（海报式多页）")
+                                    .checked(image_scale.poster)
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| this.toggle_image_poster(cx));
+                                        }
+                                    }),
+                            )
+                            .item(PopupMenuItem::new("图片位置居中").on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.center_image(cx));
+                                }
+                            }));
+                    }
+
+                    menu.separator().item(
+                        PopupMenuItem::new("退出")
+                            .icon(IconName::Close)
+                            .on_click(|_, _, cx| cx.quit()),
+                    )
                 })
         };
 
@@ -2004,8 +2354,57 @@ fn line_runs(
     runs
 }
 
+/// 把 `job` 交给打印机：系统对话框与光栅化都在后台，结果用通知报到 `window` 上。
+///
+/// 主窗口与预览窗口共用这一段，打印行为与提示文案只有一份。
+pub(crate) fn run_print_job<T: 'static>(job: PrintJob, window: &mut Window, cx: &mut Context<T>) {
+    // Both the dialog and the spooling run off the UI thread: the dialog waits
+    // for the user and long PDFs take a while to rasterize, and the window
+    // should stay responsive in the meantime.
+    let owner = print::foreground_owner();
+    cx.spawn_in(window, async move |view, cx| {
+        let result = cx
+            .background_spawn(async move { print::print(owner, job) })
+            .await;
+
+        view.update_in(cx, |_this, window, cx| match result {
+            Ok(Some(summary)) => {
+                let notification = if summary.printed == 0 {
+                    if summary.total == 0 {
+                        Notification::info("文档没有可打印的内容")
+                    } else {
+                        Notification::info(format!(
+                            "指定范围内没有可打印的页面（文档共 {} 页）",
+                            summary.total
+                        ))
+                    }
+                } else if summary.printed < summary.total {
+                    Notification::success(format!(
+                        "已发送 {} 页到打印机（文档共 {} 页）",
+                        summary.printed, summary.total
+                    ))
+                } else {
+                    Notification::success(format!("已发送 {} 页到打印机", summary.printed))
+                };
+                window.push_notification(notification, cx);
+            }
+            Ok(None) => {}
+            Err(message) => {
+                window.push_notification(Notification::error(format!("打印失败：{message}")), cx)
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
 impl Render for PoemReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The document to restore is opened once the window can take a task.
+        if let Some(path) = self.pending_open.take() {
+            self.open_path(path, window, cx);
+        }
+
         // GPUI reuses the element tree while a window is resized, so the text is
         // only wrapped again when the resize is reported here.
         if self.bounds_subscription.is_none() {
@@ -2027,6 +2426,42 @@ impl Render for PoemReader {
         let title_bar = self.render_title_bar(cx).into_any_element();
         let body = self.render_body(window, foreground, cx);
 
+        // Reading a file happens in the background, so the page on screen stays
+        // put until the new one is ready. Without a note the window would just
+        // look stuck for a few seconds.
+        let body = match self.opening.clone() {
+            Some(name) => div()
+                .relative()
+                .flex_1()
+                .min_h(px(0.))
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(body)
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(10.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(foreground.opacity(0.10))
+                                .text_xs()
+                                .child(format!("正在打开 {name}…")),
+                        ),
+                )
+                .into_any_element(),
+            None => body,
+        };
+
+        // The preview lives in its own window, so the reading position always
+        // follows this window's scroll area.
         if let Some(position) = self.current_position(window) {
             self.latest_position.set(Some(position));
         }
@@ -2068,6 +2503,7 @@ fn show_about(window: &mut Window, cx: &mut App) {
                     .child("· 所有文档都支持鼠标拖拽平移，图片还可用鼠标滚轮缩放")
                     .child("· 纯文本可用右键菜单切换「拖拽平移 / 划选文字」")
                     .child("· 划选后用 Ctrl+C 或右键菜单「复制所选文字」复制")
+                    .child("· 「文件 → 打印预览…」或 Ctrl+Shift+P 在单独的窗口中查看打印效果，Esc 关闭预览")
                     .child("· 「文件 → 打印…」或 Ctrl+P 打印文本、Markdown、PDF、Word、Excel 与图片")
                     .child("· 打印对话框中可选「页码」只打印指定页或页码范围")
                     .child("· 「字体大小」调整纯文本；Markdown / PDF / Word / Excel / 图片为「页面缩放」")

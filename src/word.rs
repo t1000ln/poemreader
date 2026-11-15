@@ -474,7 +474,11 @@ struct DecodedImage {
 fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
     let image = image::load_from_memory(bytes).ok()?;
     let pixels = image.to_rgba8();
-    let render = RenderImage::new(vec![Frame::new(pixels.clone())]);
+    // The window reads a texture as BGRA, so the copy it draws is converted;
+    // the printer keeps the straight RGBA one.
+    let mut display = pixels.clone();
+    crate::picture::to_render_pixels(&mut display);
+    let render = RenderImage::new(vec![Frame::new(display)]);
     Some(DecodedImage {
         render: Arc::new(render),
         pixels: Arc::new(pixels),

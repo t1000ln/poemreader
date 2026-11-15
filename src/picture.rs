@@ -235,7 +235,7 @@ fn render_frame(frame: &Frame) -> Frame {
 
 /// GPUI expects premultiplied BGRA, while the decoded pixels are straight
 /// RGBA.
-fn to_render_pixels(pixels: &mut RgbaImage) {
+pub(crate) fn to_render_pixels(pixels: &mut RgbaImage) {
     let data: &mut [u8] = pixels;
     for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
