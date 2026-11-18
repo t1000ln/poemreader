@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::print::{ImagePrint, Orientation, PagesPerSheet, PrintFit};
+
 /// Reading colour scheme, persisted by name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +37,44 @@ pub enum PointerMode {
     Select,
 }
 
+/// 上一次打印用的参数，跨会话记忆，免得每次打印都要重新确认。
+///
+/// 与 [`crate::print`] 里的打印参数一一对应：适应方式、纸张方向、每张纸印几页、
+/// 图片怎么印。预览里改过、或直接打印前改过的值，都会写回这里。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrintParams {
+    /// 内容超出纸宽时收进纸里还是按原尺寸裁掉。
+    pub fit: PrintFit,
+    /// 纸张方向：纵向或横向。
+    pub orientation: Orientation,
+    /// 每张纸印几页：1 合 1、2 合 1、4 合 1……
+    pub pages_per_sheet: PagesPerSheet,
+    /// 图片怎么印：印多大、从画面哪一块开始、要不要拼成多页。
+    pub image: ImagePrint,
+    /// 页脚要不要印「n / m」页号。
+    pub page_number: bool,
+}
+
+impl Default for PrintParams {
+    fn default() -> Self {
+        Self {
+            fit: PrintFit::default(),
+            orientation: Orientation::default(),
+            pages_per_sheet: PagesPerSheet::default(),
+            image: ImagePrint::default(),
+            page_number: false,
+        }
+    }
+}
+
+impl PrintParams {
+    /// 读回的参数夹回合法范围：拖动基准点万一存出界，印的时候也回得来。
+    pub fn sanitized(&mut self) {
+        self.image.anchor = self.image.anchor.clamped();
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -47,6 +87,8 @@ pub struct Settings {
     /// Reading position keyed by file: a scroll offset for text files, and a
     /// `page + fraction` anchor for PDFs.
     pub reading_positions: HashMap<String, f32>,
+    /// 上一次打印用的参数，打印时先按它来。
+    pub print_params: PrintParams,
 }
 
 impl Default for Settings {
@@ -58,6 +100,7 @@ impl Default for Settings {
             pointer_mode: PointerMode::default(),
             last_file: None,
             reading_positions: HashMap::new(),
+            print_params: PrintParams::default(),
         }
     }
 }
@@ -85,11 +128,12 @@ pub struct Store {
 impl Store {
     pub fn load() -> Self {
         let path = settings_path();
-        let settings = path
+        let mut settings: Settings = path
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        settings.print_params.sanitized();
 
         Self { path, settings }
     }
@@ -155,5 +199,56 @@ fn settings_path() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
         base.map(|dir| dir.join("poemreader").join("settings.json"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::print::{ImageAnchor, ImageScale};
+
+    /// 打印参数跟着设置一起存一起取，字段名也不能悄悄变。
+    #[test]
+    fn print_params_round_trip_through_json() {
+        let mut image = ImagePrint {
+            scale: ImageScale(200),
+            anchor: ImageAnchor { x: 0.25, y: 0.75 },
+            poster: true,
+        };
+        image.anchor = image.anchor.clamped();
+        let params = PrintParams {
+            fit: PrintFit::ActualSize,
+            orientation: Orientation::Landscape,
+            pages_per_sheet: PagesPerSheet::Four,
+            image,
+            page_number: true,
+        };
+
+        let text = serde_json::to_string(&params).expect("serialize");
+        let back: PrintParams = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back, params);
+    }
+
+    /// 老配置文件里没有打印参数这一节，读进来用默认值，不能报错。
+    #[test]
+    fn a_settings_file_without_print_params_still_loads() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("an object")
+            .remove("print_params");
+        let text = serde_json::to_string(&value).expect("serialize");
+
+        let settings: Settings = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(settings.print_params, PrintParams::default());
+    }
+
+    /// 越界的拖动基准点读回来时被夹回画面里。
+    #[test]
+    fn an_out_of_range_anchor_is_sanitized_on_load() {
+        let mut params = PrintParams::default();
+        params.image.anchor = ImageAnchor { x: 3.0, y: -0.5 };
+        params.sanitized();
+        assert_eq!(params.image.anchor, ImageAnchor { x: 1.0, y: 0.0 });
     }
 }

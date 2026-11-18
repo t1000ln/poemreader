@@ -8,15 +8,54 @@
 
 use crate::cfb::CompoundFile;
 use crate::word::{
-    Align, Block, Paragraph, ParagraphBorder, Run, Table, TableCell, WordDocument, format_counter,
+    Align, Block, Paragraph, ParagraphBorder, Run, Table, TableCell, VAlign, WordDocument,
+    format_counter,
 };
 use std::collections::HashMap;
 
-/// Text column width of a Word 97 page with 1.25-inch margins, in points.
-const CONTENT_WIDTH: f32 = 6.0 * 72.0;
 /// Word's default body size, in points.
 const DEFAULT_SIZE: f32 = 10.5;
 const TWIPS_PER_POINT: f32 = 20.0;
+
+/// Page geometry of a section, in points.
+///
+/// Word stores these in the section descriptor; a file without one falls back
+/// to the page Word itself assumes, an A4 sheet with the stock margins.
+#[derive(Clone, Copy)]
+struct PageSetup {
+    width: f32,
+    height: f32,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    /// Whether the file actually declared a section instead of the defaults.
+    declared: bool,
+}
+
+impl Default for PageSetup {
+    fn default() -> Self {
+        // Word's stock page for a Chinese installation, which is also what
+        // LibreOffice falls back to when a file carries no section: A4 with
+        // 1.25-inch side margins and 1-inch top and bottom margins.
+        Self {
+            width: 11906.0 / TWIPS_PER_POINT,
+            height: 16838.0 / TWIPS_PER_POINT,
+            left: 1800.0 / TWIPS_PER_POINT,
+            right: 1800.0 / TWIPS_PER_POINT,
+            top: 1440.0 / TWIPS_PER_POINT,
+            bottom: 1440.0 / TWIPS_PER_POINT,
+            declared: false,
+        }
+    }
+}
+
+impl PageSetup {
+    /// Width of the text column between the side margins.
+    fn column_width(self) -> f32 {
+        (self.width - self.left - self.right).max(72.0)
+    }
+}
 
 /// Parse a `.doc` file.
 pub fn load(data: Vec<u8>) -> Result<WordDocument, String> {
@@ -62,11 +101,12 @@ pub fn load(data: Vec<u8>) -> Result<WordDocument, String> {
     let fonts = fonts(&word_stream, &table_stream);
     let styles = style_props(&word_stream, &table_stream);
     let lists = Lists::parse(&word_stream, &table_stream);
+    let page = page_setup(&word_stream, &table_stream);
 
     let mut raws = read_paragraphs(&word_stream, &pieces, &chpx, &papx, &fonts, ccp_text);
     apply_style_props(&mut raws, &styles);
     apply_markers(&mut raws, &lists);
-    let blocks = build_blocks(raws);
+    let blocks = build_blocks(raws, page.column_width());
     if blocks.is_empty() {
         return Err(String::from("这份 Word 文档没有可显示的内容"));
     }
@@ -74,7 +114,12 @@ pub fn load(data: Vec<u8>) -> Result<WordDocument, String> {
 
     Ok(WordDocument {
         blocks,
-        content_width: CONTENT_WIDTH,
+        content_width: page.column_width(),
+        page_width: Some(page.width),
+        margin_left: page.left,
+        margin_right: page.right,
+        margin_top: page.top,
+        margin_bottom: page.bottom,
         paragraphs,
     })
 }
@@ -153,6 +198,68 @@ fn piece_table(clx: &[u8]) -> Result<Vec<Piece>, String> {
         });
     }
     Ok(pieces)
+}
+
+// ---------------------------------------------------------------- page setup
+
+/// Page size and margins declared by the first section of the document.
+///
+/// The section table (`plcfSed`) points at a `SEPX` in the WordDocument stream
+/// which holds the page geometry as property modifiers. Files written by some
+/// generators carry no section at all; those keep Word's own defaults.
+fn page_setup(word: &[u8], table: &[u8]) -> PageSetup {
+    let mut setup = PageSetup::default();
+    let fc = read_u32(word, 0x00CA) as usize;
+    let lcb = read_u32(word, 0x00CE) as usize;
+    if lcb < 20 {
+        return setup;
+    }
+    let Some(data) = table.get(fc..fc.saturating_add(lcb)) else {
+        return setup;
+    };
+    // One CP per section plus a terminator, then one 12-byte SED per section.
+    let sections = (lcb - 4) / 16;
+    if sections == 0 {
+        return setup;
+    }
+    let Some(sed) = data.get(4 * (sections + 1)..4 * (sections + 1) + 12) else {
+        return setup;
+    };
+    let fc_sepx = read_u32(sed, 2) as usize;
+    if fc_sepx == 0 {
+        return setup;
+    }
+    let Some(length) = word.get(fc_sepx..fc_sepx + 2) else {
+        return setup;
+    };
+    let length = u16::from_le_bytes([length[0], length[1]]) as usize;
+    let Some(grpprl) = word.get(fc_sepx + 2..fc_sepx + 2 + length) else {
+        return setup;
+    };
+
+    let mut position = 0usize;
+    while position + 2 <= grpprl.len() {
+        let sprm = read_u16(grpprl, position);
+        let Some(size) = sprm_operand_size(sprm, &grpprl[position + 2..]) else {
+            break;
+        };
+        let operand = position + 2;
+        if operand + size > grpprl.len() {
+            break;
+        }
+        match sprm {
+            0xB01F => setup.width = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            0xB020 => setup.height = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            0xB021 => setup.left = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            0xB022 => setup.right = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            0x9023 => setup.top = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            0x9024 => setup.bottom = read_u16(grpprl, operand) as f32 / TWIPS_PER_POINT,
+            _ => {}
+        }
+        position = operand + size;
+    }
+    setup.declared = true;
+    setup
 }
 
 // ------------------------------------------------------------- property runs
@@ -314,17 +421,115 @@ struct ParaProps {
     style: Option<u16>,
     in_table: bool,
     row_end: bool,
+    /// Vertical merge flags of every cell, carried by the `sprmTDefTable` of
+    /// the paragraph that ends a table row.
+    cells: Option<RowCells>,
     align: Option<u8>,
     indent: Option<i16>,
     first_line: Option<i16>,
     space_before: Option<u16>,
     space_after: Option<u16>,
+    /// Line spacing as a multiple, in 240ths of a line.
     line_spacing: Option<u16>,
+    /// Fixed line spacing in twips, from a `sprmPDyaLine` without the
+    /// multiple flag.
+    line_exact: Option<i16>,
     /// List instance the paragraph belongs to; `ilfo` is one-based and zero
     /// means "no list".
     ilfo: Option<u16>,
     /// Level of the list, zero-based.
     ilvl: Option<u8>,
+    /// Minimum height of a table row in twips, from the `sprmPHt` of the
+    /// paragraph that ends the row.
+    row_height: Option<u16>,
+    /// Every sprm of the paragraph, kept so diagnostics can print what the
+    /// file really contains.
+    sprms: Vec<(u16, Vec<u8>)>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct CellMerge {
+    /// `TCGRF.horzMerge`: 0 = not merged, 1 = absorbed by the merge to its
+    /// left, 2 or 3 = first cell of a horizontally merged set.
+    horz_merge: u8,
+    /// `TCGRF.vertMerge`: 0 = not merged, 1 = continues a merge with the
+    /// cell above, 3 = first cell of a vertically merged set.
+    vert_merge: u8,
+    /// `TCGRF.vertAlign`: 0 = top, 1 = centre, 2 = bottom.
+    vert_align: u8,
+}
+
+/// The cell layout of one table row, read from its `sprmTDefTable`.
+#[derive(Default, Clone)]
+struct RowCells {
+    /// Horizontal position of every cell edge in twips, one more entry than
+    /// the cells. A horizontally merged cell stores the outer edges of the
+    /// merged area, so its edges skip the columns it covers.
+    edges: Vec<i16>,
+    cells: Vec<CellMerge>,
+}
+
+/// The table definition of one row plus the row properties that travel in
+/// the same PAPX.
+#[derive(Default, Clone)]
+struct RowShape {
+    cells: RowCells,
+    /// Minimum row height in twips, from `sprmPHt`.
+    min_height: Option<u16>,
+}
+
+/// The cell descriptors of a `sprmTDefTable` operand, a `TDefTableOperand`
+/// per [MS-DOC]: a 2-byte length that counts the rest of the structure plus
+/// one, a 1-byte column count, one 2-byte edge per column boundary, and a
+/// 20-byte `TC80` per column whose leading `TCGRF` holds the merge flags.
+fn table_row_cells(operand: &[u8]) -> Option<RowCells> {
+    let count = *operand.get(2)? as usize;
+    if count == 0 || count > 63 {
+        return None;
+    }
+    let mut edges = Vec::with_capacity(count + 1);
+    for index in 0..=count {
+        edges.push(read_u16(operand, 3 + index * 2) as i16);
+    }
+    // The count sits at offset 2, the column edges start right after it.
+    let tc_offset = 3 + (count + 1) * 2;
+    let mut cells = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = tc_offset + index * 20;
+        let cell = operand.get(start..start + 20)?;
+        let tcgrf = read_u16(cell, 0);
+        cells.push(CellMerge {
+            horz_merge: (tcgrf & 0x0003) as u8,
+            vert_merge: ((tcgrf >> 5) & 0x0003) as u8,
+            vert_align: ((tcgrf >> 7) & 0x0003) as u8,
+        });
+    }
+    Some(RowCells { edges, cells })
+}
+
+/// The span each cell of a row takes, from its merge flags: a cell that
+/// starts a horizontal merge absorbs the cells to its right that carry the
+/// continuation value, and those get no span at all (they are dropped). A
+/// continuation reached on its own is malformed and stays a plain cell.
+fn horizontal_spans(cells: &[CellMerge]) -> Vec<usize> {
+    let mut span_of = vec![1usize; cells.len()];
+    let mut index = 0usize;
+    while index < cells.len() {
+        if cells[index].horz_merge >= 2 {
+            let absorbed = cells[index + 1..]
+                .iter()
+                .take_while(|merge| merge.horz_merge == 1)
+                .count();
+            span_of[index] = 1 + absorbed;
+            for offset in 1..=absorbed {
+                span_of[index + offset] = 0;
+            }
+            index += 1 + absorbed;
+        } else {
+            index += 1;
+        }
+    }
+    span_of
 }
 
 fn para_props(page: &[u8], start: usize, region_end: usize) -> ParaProps {
@@ -371,18 +576,27 @@ fn para_props(page: &[u8], start: usize, region_end: usize) -> ParaProps {
             break;
         };
         position += size;
+        props.sprms.push((sprm, operand.to_vec()));
         match sprm {
             0x2416 => props.in_table = operand[0] & 1 != 0,
             0x2417 => props.row_end = operand[0] & 1 != 0,
+            0x9407 => props.row_height = Some(read_u16(operand, 0)),
+            0xD608 => props.cells = table_row_cells(operand),
             0x2403 | 0x2461 => props.align = Some(operand[0]),
             0x840F => props.indent = Some(read_u16(operand, 0) as i16),
             0x8411 => props.first_line = Some(read_u16(operand, 0) as i16),
             0xA413 => props.space_before = Some(read_u16(operand, 0)),
             0xA414 => props.space_after = Some(read_u16(operand, 0)),
             0x6412 => {
-                let mode = read_u16(operand, 0) as i16;
-                if mode == 0 {
-                    props.line_spacing = Some(read_u16(operand, 2));
+                // `LineSpacingOperand`: a signed line height in twips and a
+                // flag; a set flag makes the height a multiple of 240ths of
+                // a line, otherwise it is a fixed height.
+                let dya = read_u16(operand, 0) as i16;
+                let multiple = operand.get(2).copied().unwrap_or(0) & 1 != 0;
+                if multiple {
+                    props.line_spacing = Some(dya.unsigned_abs());
+                } else if dya != 0 {
+                    props.line_exact = Some(dya);
                 }
             }
             0x460B => props.ilfo = Some(read_u16(operand, 0)),
@@ -714,8 +928,10 @@ fn sprm_operand_size(sprm: u16, data: &[u8]) -> Option<usize> {
         6 => {
             let first = *data.first()? as usize;
             match sprm {
-                // A table definition stores its length in the first two bytes.
-                0xD608 => 2 + read_u16(data, 1) as usize,
+                // A table definition stores its length in the first two
+                // bytes, which counts the rest of the operand plus one, so
+                // the whole operand is one byte shorter than it claims.
+                0xD608 => 1 + read_u16(data, 0) as usize,
                 _ => 1 + first,
             }
         }
@@ -768,6 +984,7 @@ fn font_name(entry: &[u8]) -> String {
 
 // ------------------------------------------------------------- text reading
 
+#[derive(Clone, Copy, PartialEq)]
 enum Terminator {
     Paragraph,
     Cell,
@@ -949,8 +1166,17 @@ fn paragraph(
         _ => Align::Left,
     };
     let line_spacing = para
-        .line_spacing
-        .map(|value| (value as f32 / 240.0).clamp(0.8, 3.0))
+        .line_exact
+        .map(|twips| {
+            // A fixed line height in points. The renderer multiplies the
+            // size by 1.3 for a single line, so divide by that to land on
+            // the exact height the file asks for.
+            ((twips.unsigned_abs() as f32 / TWIPS_PER_POINT) / (size * 1.3)).clamp(0.8, 4.0)
+        })
+        .or_else(|| {
+            para.line_spacing
+                .map(|value| (value as f32 / 240.0).clamp(0.8, 3.0))
+        })
         .unwrap_or(1.0);
     RawParagraph {
         paragraph: Paragraph {
@@ -1010,9 +1236,14 @@ fn highlight(index: u8) -> Option<u32> {
 
 // ------------------------------------------------------------------- blocks
 
-fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
+fn build_blocks(raws: Vec<RawParagraph>, column_width: f32) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut rows: Vec<Vec<TableCell>> = Vec::new();
+    // The table definition of each row, index-aligned with `rows`.
+    let mut shapes: Vec<Option<RowShape>> = Vec::new();
+    // The paragraph that ends the first row. LibreOffice renders it as an
+    // empty line above the table, so the reader does the same.
+    let mut first_row_mark: Option<Paragraph> = None;
     let mut row: Vec<TableCell> = Vec::new();
     let mut cell: Vec<Paragraph> = Vec::new();
     let mut in_table = false;
@@ -1020,7 +1251,7 @@ fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
     // an empty cell-marked paragraph is taken as the end of the row instead.
     let ttp_seen = raws.iter().any(|raw| raw.para.row_end);
 
-    for raw in raws {
+    for mut raw in raws {
         match raw.terminator {
             Terminator::Cell => {
                 in_table = true;
@@ -1030,6 +1261,18 @@ fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
                     if !cell.is_empty() {
                         row.push(cell_of(std::mem::take(&mut cell)));
                     }
+                    if rows.is_empty() {
+                        first_row_mark = Some(raw.paragraph.clone());
+                    }
+                    // The row-mark paragraph carries the table definition of
+                    // this row: the cell edges, the merge flags and the row
+                    // height. It is matched with the row when the table is
+                    // flushed, once the whole grid is known.
+                    let cells = raw.para.cells.take();
+                    shapes.push(Some(RowShape {
+                        cells: cells.unwrap_or_default(),
+                        min_height: raw.para.row_height,
+                    }));
                     rows.push(std::mem::take(&mut row));
                 } else {
                     cell.push(raw.paragraph);
@@ -1046,7 +1289,15 @@ fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
                     cell.push(raw.paragraph);
                 } else {
                     if in_table || !rows.is_empty() || !row.is_empty() || !cell.is_empty() {
-                        flush_table(&mut blocks, &mut rows, &mut row, &mut cell);
+                        flush_table(
+                            &mut blocks,
+                            &mut rows,
+                            &mut shapes,
+                            &mut first_row_mark,
+                            &mut row,
+                            &mut cell,
+                            column_width,
+                        );
                     }
                     in_table = false;
                     blocks.push(Block::Paragraph(raw.paragraph));
@@ -1055,7 +1306,15 @@ fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
         }
     }
     if in_table || !rows.is_empty() || !row.is_empty() || !cell.is_empty() {
-        flush_table(&mut blocks, &mut rows, &mut row, &mut cell);
+        flush_table(
+            &mut blocks,
+            &mut rows,
+            &mut shapes,
+            &mut first_row_mark,
+            &mut row,
+            &mut cell,
+            column_width,
+        );
     }
     blocks
 }
@@ -1063,6 +1322,10 @@ fn build_blocks(raws: Vec<RawParagraph>) -> Vec<Block> {
 fn cell_of(paragraphs: Vec<Paragraph>) -> TableCell {
     TableCell {
         span: 1,
+        merge_start: false,
+        covered: false,
+        row_span: 1,
+        v_align: Default::default(),
         fill: None,
         blocks: paragraphs.into_iter().map(Block::Paragraph).collect(),
     }
@@ -1071,8 +1334,11 @@ fn cell_of(paragraphs: Vec<Paragraph>) -> TableCell {
 fn flush_table(
     blocks: &mut Vec<Block>,
     rows: &mut Vec<Vec<TableCell>>,
+    shapes: &mut Vec<Option<RowShape>>,
+    first_row_mark: &mut Option<Paragraph>,
     row: &mut Vec<TableCell>,
     cell: &mut Vec<Paragraph>,
+    column_width: f32,
 ) {
     if !cell.is_empty() {
         row.push(cell_of(std::mem::take(cell)));
@@ -1083,13 +1349,118 @@ fn flush_table(
     if rows.is_empty() {
         return;
     }
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    let width = CONTENT_WIDTH / columns as f32;
-    blocks.push(Block::Table(Table {
+    shapes.resize(rows.len(), None);
+
+    // The grid of the table is the union of the cell edges of every row. A
+    // horizontally merged cell simply skips the edges it covers, so counting
+    // the edges between a cell's sides gives its column span.
+    let mut grid: Vec<i16> = shapes
+        .iter()
+        .flatten()
+        .flat_map(|shape| shape.cells.edges.iter().copied())
+        .collect();
+    grid.sort_unstable();
+    grid.dedup_by(|a, b| (*a - *b).abs() <= 3);
+
+    for (index, row) in rows.iter_mut().enumerate() {
+        let Some(shape) = shapes[index].as_ref() else {
+            continue;
+        };
+        // Files write one cell mark per cell, while some writers list every
+        // grid column and let the flags name the absorbed ones; both are
+        // mapped onto the row here.
+        let span_of = horizontal_spans(&shape.cells.cells);
+        let order: Vec<usize> = if shape.cells.cells.len() == row.len() {
+            (0..row.len()).collect()
+        } else {
+            let marked: Vec<usize> = (0..shape.cells.cells.len())
+                .filter(|at| span_of[*at] > 0)
+                .collect();
+            if marked.len() != row.len() {
+                continue;
+            }
+            marked
+        };
+
+        for (position, cell) in row.iter_mut().enumerate() {
+            let at = order[position];
+            let merge = shape.cells.cells[at];
+            cell.merge_start = merge.vert_merge == 3;
+            cell.covered = merge.vert_merge == 1;
+            cell.v_align = match merge.vert_align {
+                1 => VAlign::Center,
+                2 => VAlign::Bottom,
+                _ => VAlign::Top,
+            };
+            // The edges say how many grid columns the cell covers; the merge
+            // flags stand in for writers that keep every edge.
+            let from_edges = shape
+                .cells
+                .edges
+                .get(at..at + 2)
+                .and_then(|edges| grid_span(&grid, edges[0], edges[1]))
+                .unwrap_or(1);
+            cell.span = from_edges.max(span_of[at]).max(1);
+        }
+    }
+
+    // Rows with merged cells hold fewer cells, so the column count follows
+    // the spans instead of the cell counts.
+    let columns = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.span.max(1)).sum::<usize>())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    // The grid edges carry the real column widths in twips; Word lays the
+    // table out at its own size even when it runs past the text column.
+    let first = grid.first().copied().unwrap_or(0);
+    let last = grid.last().copied().unwrap_or(0);
+    let total = (last - first).max(1) as f32;
+    let unit = if total > 40.0 { 1.0 / TWIPS_PER_POINT } else { column_width / total };
+    let mut widths: Vec<f32> = grid
+        .windows(2)
+        .map(|edges| (edges[1] - edges[0]) as f32 * unit)
+        .collect();
+    // A row may span more columns than the grid describes; pad the widths so
+    // every column index finds a width.
+    while widths.len() < columns {
+        widths.push(widths.last().copied().unwrap_or(column_width / columns as f32));
+    }
+    let row_heights: Vec<f32> = (0..rows.len())
+        .map(|index| {
+            shapes[index]
+                .as_ref()
+                .and_then(|shape| shape.min_height)
+                .map(|twips| twips as f32 / TWIPS_PER_POINT)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let mut table = Table {
+        // The first edge is the table's position relative to the text margin;
+        // Word lets it reach into the margin.
+        indent: if total > 40.0 { first as f32 / TWIPS_PER_POINT } else { 0.0 },
         rows: std::mem::take(rows),
-        columns: vec![width; columns],
+        columns: widths,
+        row_heights,
         borders: true,
-    }));
+    };
+    shapes.clear();
+    table.resolve_row_spans();
+    // The row-mark paragraph of the first row renders as an empty line above
+    // the table, like LibreOffice does when it imports these documents.
+    if let Some(mark) = first_row_mark.take() {
+        blocks.push(Block::Paragraph(mark));
+    }
+    blocks.push(Block::Table(table));
+}
+
+/// The number of grid columns between two cell edges; neighbouring rows
+/// differ by a few twips, so the match is tolerant.
+fn grid_span(grid: &[i16], left: i16, right: i16) -> Option<usize> {
+    let start = grid.iter().position(|edge| (*edge - left).abs() <= 3)?;
+    let end = grid.iter().rposition(|edge| (*edge - right).abs() <= 3)?;
+    (end > start).then_some(end - start)
 }
 
 // ------------------------------------------------------------------ helpers
@@ -1102,4 +1473,279 @@ fn read_u16(data: &[u8], offset: usize) -> u16 {
 fn read_u32(data: &[u8], offset: usize) -> u32 {
     let bytes = data.get(offset..offset + 4).unwrap_or(&[0, 0, 0, 0]);
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text column width used by the table tests, in points.
+    const CONTENT_WIDTH: f32 = 6.0 * 72.0;
+
+    #[test]
+    fn a_file_without_a_section_falls_back_to_word_s_page() {
+        // Files written by some generators carry no section at all; Word then
+        // lays them out on its stock A4 page.
+        let setup = page_setup(&[], &[]);
+        assert!(!setup.declared);
+        assert!((setup.width - 595.3).abs() < 0.1);
+        assert!((setup.column_width() - 415.3).abs() < 0.2);
+        assert!((setup.left - 90.0).abs() < 0.1);
+    }
+
+    fn flags(horz_merge: u8, vert_merge: u8) -> CellMerge {
+        CellMerge {
+            horz_merge,
+            vert_merge,
+            vert_align: 0,
+        }
+    }
+
+    #[test]
+    fn a_horizontal_merge_absorbs_the_cells_to_its_right() {
+        let spans = horizontal_spans(&[
+            flags(0, 0),
+            flags(2, 0),
+            flags(1, 0),
+            flags(1, 0),
+            flags(0, 0),
+        ]);
+        assert_eq!(spans, vec![1, 3, 0, 0, 1]);
+    }
+
+    #[test]
+    fn a_merged_flag_without_a_merge_to_its_left_stays_a_cell() {
+        let spans = horizontal_spans(&[flags(0, 0), flags(1, 0)]);
+        assert_eq!(spans, vec![1, 1]);
+    }
+
+    fn text(value: &str) -> Paragraph {
+        Paragraph {
+            runs: vec![Run {
+                text: String::from(value),
+                bold: false,
+                italic: false,
+                underline: false,
+                strike: false,
+                size: None,
+                color: None,
+                highlight: None,
+                font: None,
+                image: None,
+            }],
+            ..Paragraph::default()
+        }
+    }
+
+    fn shape(edges: &[i16], cells: &[(u8, u8)]) -> RowCells {
+        RowCells {
+            edges: edges.to_vec(),
+            cells: cells.iter().map(|(h, v)| flags(*h, *v)).collect(),
+        }
+    }
+
+    fn cell_paragraph(value: &str) -> RawParagraph {
+        RawParagraph {
+            paragraph: text(value),
+            terminator: Terminator::Cell,
+            para: ParaProps {
+                in_table: true,
+                ..ParaProps::default()
+            },
+        }
+    }
+
+    fn row_mark(cells: Option<RowCells>) -> RawParagraph {
+        RawParagraph {
+            paragraph: Paragraph::default(),
+            terminator: Terminator::Cell,
+            para: ParaProps {
+                in_table: true,
+                row_end: true,
+                cells,
+                ..ParaProps::default()
+            },
+        }
+    }
+
+    fn body_paragraph() -> RawParagraph {
+        RawParagraph {
+            paragraph: text("正文"),
+            terminator: Terminator::Paragraph,
+            para: ParaProps::default(),
+        }
+    }
+
+    fn first_table(blocks: &[Block]) -> &Table {
+        blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Table(table) => Some(table),
+                Block::Paragraph(_) => None,
+            })
+            .expect("the blocks hold a table")
+    }
+
+    #[test]
+    fn a_row_whose_cells_skip_an_edge_spans_two_columns() {
+        let raws = vec![
+            cell_paragraph("a"),
+            cell_paragraph("b"),
+            cell_paragraph("c"),
+            row_mark(Some(shape(
+                &[0, 100, 200, 300],
+                &[(0, 0), (0, 0), (0, 0)],
+            ))),
+            cell_paragraph("宽"),
+            cell_paragraph("d"),
+            row_mark(Some(shape(&[0, 200, 300], &[(0, 0), (0, 0)]))),
+            body_paragraph(),
+        ];
+        let blocks = build_blocks(raws, CONTENT_WIDTH);
+        let table = first_table(&blocks);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(table.rows[1][0].span, 2);
+        assert_eq!(table.rows[1][1].span, 1);
+    }
+
+    #[test]
+    fn a_vertical_merge_covers_the_cell_below_it() {
+        let raws = vec![
+            cell_paragraph("上"),
+            cell_paragraph("右一"),
+            row_mark(Some(shape(&[0, 100, 200], &[(0, 3), (0, 0)]))),
+            cell_paragraph(""),
+            cell_paragraph("右二"),
+            row_mark(Some(shape(&[0, 100, 200], &[(0, 1), (0, 0)]))),
+            body_paragraph(),
+        ];
+        let blocks = build_blocks(raws, CONTENT_WIDTH);
+        let table = first_table(&blocks);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0].row_span, 2);
+        assert!(table.rows[0][0].merge_start);
+        assert!(table.rows[1][0].covered);
+        assert_eq!(table.rows[1][0].row_span, 1);
+    }
+
+    #[test]
+    fn a_writer_that_lists_every_column_still_merges_its_cells() {
+        // Three descriptors with the second absorbed, but only two marks.
+        let raws = vec![
+            cell_paragraph("宽"),
+            cell_paragraph("d"),
+            row_mark(Some(shape(
+                &[0, 100, 200, 300],
+                &[(2, 0), (1, 0), (0, 0)],
+            ))),
+            body_paragraph(),
+        ];
+        let blocks = build_blocks(raws, CONTENT_WIDTH);
+        let table = first_table(&blocks);
+        assert_eq!(table.rows[0].len(), 2);
+        assert_eq!(table.rows[0][0].span, 2);
+    }
+
+    #[test]
+    fn the_sample_document_keeps_the_merged_row_of_its_table() {
+        let document = load(include_bytes!("../samples/_legacy-sample.doc").to_vec())
+            .expect("the sample document loads");
+        let table = first_table(&document.blocks);
+        let last = table.rows.last().expect("the sample table has rows");
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0].span, 2);
+        assert_eq!(last[1].span, 1);
+    }
+
+    #[test]
+    fn column_widths_follow_the_cell_edges() {
+        let raws = vec![
+            cell_paragraph("左"),
+            cell_paragraph("右"),
+            row_mark(Some(shape(&[0, 1000, 3000], &[(0, 0), (0, 0)]))),
+            body_paragraph(),
+        ];
+        let blocks = build_blocks(raws, CONTENT_WIDTH);
+        let table = first_table(&blocks);
+        // The edges carry the true widths in twips: 1000 and 2000 twips.
+        assert!((table.columns[0] - 50.0).abs() < 0.01);
+        assert!((table.columns[1] - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_cells_vertical_alignment_reaches_the_model() {
+        let mut marks = shape(&[0, 100, 200], &[(0, 0), (0, 0)]);
+        marks.cells[0].vert_align = 1;
+        let raws = vec![
+            cell_paragraph("上"),
+            cell_paragraph("右"),
+            row_mark(Some(marks)),
+            body_paragraph(),
+        ];
+        let blocks = build_blocks(raws, CONTENT_WIDTH);
+        let table = first_table(&blocks);
+        assert_eq!(table.rows[0][0].v_align, VAlign::Center);
+        assert_eq!(table.rows[0][1].v_align, VAlign::Top);
+    }
+
+    #[test]
+    fn the_cell_flags_of_a_row_carry_the_alignment_bits() {
+        // cb = 1 + 1 (count) + 3 edges * 2 + 2 TCs * 20 = 48, two columns.
+        let mut operand = vec![48u8, 0, 2, 0, 0, 100, 0, 200, 0];
+        let mut first = [0u8; 20];
+        // horzMerge = 2 in the low bits, vertAlign = 2 (bottom) in bits 7-8.
+        first[0] = 0x02;
+        first[1] = 0x01;
+        operand.extend_from_slice(&first);
+        operand.extend_from_slice(&[0u8; 20]);
+        let cells = table_row_cells(&operand).expect("the operand parses");
+        assert_eq!(cells.cells.len(), 2);
+        assert_eq!(cells.cells[0].horz_merge, 2);
+        assert_eq!(cells.cells[0].vert_align, 2);
+        assert_eq!(cells.cells[1].vert_align, 0);
+    }
+
+    #[test]
+    fn trailing_whitespace_is_trimmed_with_its_runs() {
+        use crate::render::word::push_text_run;
+        // A title padded with spaces of another size, like the ones Word
+        // documents put at the end of a line; gpui never offers a wrap
+        // candidate inside whitespace, so the padding has to go.
+        let face = gpui_kit::font("\u{5b8b}\u{4f53}");
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        push_text_run(&mut text, &mut runs, "\u{9a86}\u{9a7c}\u{7965}\u{5b50}", &face, gpui_kit::Hsla::default(), None, false, false);
+        push_text_run(&mut text, &mut runs, "        ", &face, gpui_kit::Hsla::default(), None, false, false);
+
+        crate::render::word::trim_trailing_whitespace(&mut text, &mut runs);
+
+        assert_eq!(text, "\u{9a86}\u{9a7c}\u{7965}\u{5b50}");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, "\u{9a86}\u{9a7c}\u{7965}\u{5b50}".len());
+    }
+
+    /// A short line never wraps, whatever the width cache holds.
+    #[test]
+    fn a_short_line_stays_one_row() {
+        let widths = crate::wrap::CharWidths::empty();
+        assert!(crate::wrap::wrap_line("短文本", 600., &widths).is_empty());
+    }
+
+    /// The first wrap boundary falls where the width is exceeded; an exact
+    /// fit does not wrap.
+    #[test]
+    fn an_overlong_line_wraps_at_the_width() {
+        let mut map = std::collections::HashMap::new();
+        // 每个全角字符宽 10px，七个字共 70px。
+        for c in "一二三四五六七".chars() {
+            map.insert(c, 10.0);
+        }
+        let widths = crate::wrap::CharWidths::from_map(map);
+        // 宽 60px：六个字放满，第七个字超宽，在它的起点断行。
+        assert_eq!(crate::wrap::wrap_line("一二三四五六七", 60., &widths), vec![18]);
+        assert_eq!(crate::wrap::wrap_line("一二三四五六七", 69., &widths), vec![18]);
+        // 宽 70px：正好放满，不断行。
+        assert!(crate::wrap::wrap_line("一二三四五六七", 70., &widths).is_empty());
+    }
 }

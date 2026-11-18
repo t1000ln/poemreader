@@ -4,10 +4,20 @@
 //! wrapped once per font size and wrap width and the view only draws the rows
 //! that are on screen. Row tops stay here, so hit testing, scrolling and the
 //! scrollbar never depend on which rows happen to be rendered.
+//!
+//! Wrapping is the only step that is proportional to the file size, so the
+//! character widths are measured once in batch (see [`crate::wrap`]) and large
+//! files are then split at line boundaries and wrapped on several threads.
+//! Chunk boundaries always fall right after a `\n`, which makes the per-chunk
+//! work independent: rows from different chunks never share a source line, so
+//! concatenating the per-chunk results in chunk order reproduces exactly what
+//! a single pass over the whole file would have produced.
 
 use std::sync::Arc;
 
 use gpui_kit::*;
+
+use crate::wrap::{wrap_line, CharWidths};
 
 /// Space between two rows, in logical pixels.
 pub const LINE_GAP: f32 = 4.;
@@ -15,6 +25,9 @@ pub const LINE_GAP: f32 = 4.;
 const BLANK_LINE_RATIO: f32 = 0.6;
 /// Never wrap narrower than this, so a very narrow window still lays out sensibly.
 const MIN_WRAP_WIDTH: f32 = 120.;
+/// Files smaller than this are wrapped on one thread; splitting a small file
+/// across threads costs more in thread setup than the wrapping itself saves.
+const PARALLEL_WRAP_THRESHOLD: usize = 256 * 1024;
 
 /// One visual row: a slice of the source text and where it sits vertically.
 struct Row {
@@ -22,6 +35,15 @@ struct Row {
     end: usize,
     /// The row continues a wrapped source line instead of starting one.
     continuation: bool,
+}
+
+/// One worker's share of the wrapping work. Offsets are relative to the
+/// chunk's base; merging translates them back to absolute source offsets and
+/// accumulates the heights.
+struct ChunkRows {
+    base: usize,
+    rows: Vec<(usize, usize, bool)>,
+    line_count: usize,
 }
 
 /// A text document split into visual rows for one font and wrap width.
@@ -52,73 +74,56 @@ impl TextView {
         let line_height = line_height.max(1.);
         let blank_height = blank_height(font_size);
 
-        // The wrapper caches character widths per font and size, so wrapping a
-        // large file is a single pass over its text.
-        let mut wrapper = text_system.line_wrapper(font.clone(), font_size);
-        let text = source.as_str();
+        // Chunks are cut at line boundaries; every worker reads the same
+        // immutable width cache.
+        let widths = CharWidths::measure(&source, font, font_size, text_system);
+        let chunks = split_points(&source, parallel_workers(source.len()));
+        let finished: Vec<ChunkRows> = if chunks.len() == 2 {
+            vec![wrap_chunk(
+                &source,
+                chunks[0],
+                chunks[1],
+                &widths,
+                wrap_width,
+            )]
+        } else {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = chunks
+                    .windows(2)
+                    .map(|pair| {
+                        let (start, end) = (pair[0], pair[1]);
+                        let source = &source;
+                        let widths = &widths;
+                        scope.spawn(move || {
+                            wrap_chunk(source, start, end, widths, wrap_width)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect()
+            })
+        };
+
         let mut rows = Vec::new();
         let mut tops = Vec::with_capacity(256);
         tops.push(0.);
         let mut line_count = 0;
-        let mut offset = 0;
-
-        while offset < text.len() {
-            let end = text[offset..]
-                .find('\n')
-                .map_or(text.len(), |index| offset + index);
-            // Windows files end their lines with "\r\n"; the carriage return is
-            // not part of the text.
-            let line_end = if end > offset && text.as_bytes()[end - 1] == b'\r' {
-                end - 1
-            } else {
-                end
-            };
-            line_count += 1;
-
-            let line = &text[offset..line_end];
-            let mut row_start = 0;
-            let mut first = true;
-
-            if !line.is_empty() {
-                let boundaries: Vec<usize> = wrapper
-                    .wrap_line(
-                        &[LineFragment::text(line)],
-                        px(wrap_width),
-                        IndentAdjustment::NoIndent,
-                    )
-                    .map(|boundary| boundary.ix.min(line.len()))
-                    .collect();
-
-                for boundary in boundaries {
-                    if boundary <= row_start {
-                        continue;
-                    }
-                    push_row(
-                        &mut rows,
-                        &mut tops,
-                        offset,
-                        row_start,
-                        boundary,
-                        !first,
-                        line_height,
-                        blank_height,
-                    );
-                    row_start = boundary;
-                    first = false;
-                }
+        for chunk in finished {
+            line_count += chunk.line_count;
+            for (start, end, continuation) in chunk.rows {
+                push_row(
+                    &mut rows,
+                    &mut tops,
+                    chunk.base,
+                    start,
+                    end,
+                    continuation,
+                    line_height,
+                    blank_height,
+                );
             }
-
-            push_row(
-                &mut rows,
-                &mut tops,
-                offset,
-                row_start,
-                line.len(),
-                !first,
-                line_height,
-                blank_height,
-            );
-            offset = end + 1;
         }
 
         Self {
@@ -226,10 +231,107 @@ impl TextView {
     }
 }
 
+/// How many workers to use for a file of `size` bytes. Small files stay on one
+/// thread; large ones use every core, capped so no thread gets a sliver.
+fn parallel_workers(size: usize) -> usize {
+    if size < PARALLEL_WRAP_THRESHOLD {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(8)
+}
+
+/// Cut the text into `workers` chunks at `\n` boundaries. The result always
+/// starts at 0 and ends at `text.len()`, with each interior point just after a
+/// newline, so every chunk starts on a fresh source line.
+fn split_points(text: &str, workers: usize) -> Vec<usize> {
+    let mut points = vec![0];
+    if workers <= 1 || text.len() < workers * 2 {
+        points.push(text.len());
+        return points;
+    }
+
+    let target = text.len() / workers;
+    let mut search = target;
+    while points.len() < workers {
+        // The target may land inside a multi-byte character; slide forward to
+        // the next char boundary before searching.
+        while search < text.len() && !text.is_char_boundary(search) {
+            search += 1;
+        }
+        match text[search..].find('\n') {
+            Some(index) => {
+                let point = search + index + 1;
+                points.push(point);
+                search = point + target;
+            }
+            None => break,
+        }
+    }
+    points.push(text.len());
+    points
+}
+
+/// Wrap `text[base..end]` into rows. `end` falls right after a `\n` (or at the
+/// end of the text), so every line the slice contains is complete and no state
+/// carries over to neighbouring chunks.
+fn wrap_chunk(
+    text: &str,
+    base: usize,
+    end: usize,
+    widths: &CharWidths,
+    wrap_width: f32,
+) -> ChunkRows {
+    let slice = &text[base..end];
+    let mut rows = Vec::new();
+    let mut line_count = 0;
+    let mut offset = 0;
+
+    while offset < slice.len() {
+        let line_break = slice[offset..]
+            .find('\n')
+            .map_or(slice.len(), |index| offset + index);
+        // Windows files end their lines with "\r\n"; the carriage return is
+        // not part of the text.
+        let line_end = if line_break > offset && slice.as_bytes()[line_break - 1] == b'\r' {
+            line_break - 1
+        } else {
+            line_break
+        };
+        line_count += 1;
+
+        let line = &slice[offset..line_end];
+        let mut row_start = 0;
+        let mut first = true;
+
+        if !line.is_empty() {
+            for boundary in wrap_line(line, wrap_width, widths) {
+                if boundary <= row_start {
+                    continue;
+                }
+                rows.push((offset + row_start, offset + boundary, !first));
+                row_start = boundary;
+                first = false;
+            }
+        }
+
+        rows.push((offset + row_start, offset + line.len(), !first));
+        offset = line_break + 1;
+    }
+
+    ChunkRows {
+        base,
+        rows,
+        line_count,
+    }
+}
+
 fn blank_height(font_size: Pixels) -> f32 {
     (font_size.as_f32() * BLANK_LINE_RATIO).max(1.)
 }
 
+/// Record one row against the absolute source text.
 fn push_row(
     rows: &mut Vec<Row>,
     tops: &mut Vec<f32>,

@@ -49,6 +49,7 @@ mod shortcuts;
 mod text;
 mod window;
 mod word;
+mod wrap;
 mod xls;
 
 use events::{CellSelection, Interaction, Selection};
@@ -65,9 +66,8 @@ use render::excel::{ExcelRender, excel_cells};
 use render::pdf::{PdfLayout, spawn_pdf_render};
 use render::word::{WordRender, word_block};
 use render::{LineText, SelectableLine};
-use settings::{PointerMode, ReadingBackground, Store};
-use text::TextView;
-use word::WordDocument;
+use settings::{PointerMode, PrintParams, ReadingBackground, Store};
+use text::TextView;use word::WordDocument;
 
 /// Text sizes offered in the 「字体大小」 menu.
 const FONT_SIZES: [f32; 6] = [14., 16., 18., 20., 24., 28.];
@@ -309,8 +309,12 @@ pub(crate) struct PoemReader {
     preview: Option<PreviewHandle>,
     /// 打印方向。预览里改过之后，直接打印也跟着用同一方向。
     print_orientation: Orientation,
+    /// 内容超出纸宽时收进纸里还是按原尺寸印。只在预览里能改，改了同样带回这里。
+    print_fit: PrintFit,
     /// 每张纸印几页：2 合 1、4 合 1……预览里改过之后同样带到这里。
     pages_per_sheet: PagesPerSheet,
+    /// 每页页脚要不要印「n / m」页号。预览里改过之后同样带到这里。
+    page_number: bool,
     /// 图片怎么印：印多大、从画面哪一块开始、要不要拼成多页。
     image_print: ImagePrint,
     background: ReadingBackground,
@@ -361,7 +365,7 @@ impl PoemReader {
         initial: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (font_size, pdf_zoom, background, pointer_mode) = {
+        let (font_size, pdf_zoom, background, pointer_mode, print_params) = {
             let store = store.borrow();
             let settings = store.settings();
             (
@@ -369,8 +373,17 @@ impl PoemReader {
                 settings.pdf_zoom(),
                 settings.background,
                 settings.pointer_mode,
+                settings.print_params.clone(),
             )
         };
+        let (print_fit, print_orientation, pages_per_sheet, page_number, mut image_print) = (
+            print_params.fit,
+            print_params.orientation,
+            print_params.pages_per_sheet,
+            print_params.page_number,
+            print_params.image,
+        );
+        image_print.anchor = image_print.anchor.clamped();
 
         let pending_open = initial;
         let quit_subscription = {
@@ -393,9 +406,11 @@ impl PoemReader {
             font_size,
             pdf_zoom,
             preview: None,
-            print_orientation: Orientation::default(),
-            pages_per_sheet: PagesPerSheet::default(),
-            image_print: ImagePrint::default(),
+            print_orientation,
+            print_fit,
+            pages_per_sheet,
+            page_number,
+            image_print,
             background,
             pointer_mode,
             excel_sheet: 0,
@@ -421,6 +436,23 @@ impl PoemReader {
 
     pub(crate) fn persist_settings(&self) {
         self.store.borrow().save();
+    }
+
+    /// 把当前的打印参数写进配置并落盘，作为下一次打印的默认值。
+    ///
+    /// 参数改动不频繁，每次改动直接写一次配置即可；文件很小，落盘开销可忽略。
+    fn persist_print_params(&self) {
+        {
+            let mut store = self.store.borrow_mut();
+            store.settings_mut().print_params = PrintParams {
+                fit: self.print_fit,
+                orientation: self.print_orientation,
+                pages_per_sheet: self.pages_per_sheet,
+                image: self.image_print,
+                page_number: self.page_number,
+            };
+        }
+        self.persist_settings();
     }
 
     /// Store the current reading position for the open document.
@@ -770,6 +802,7 @@ impl PoemReader {
             return;
         }
         self.print_orientation = orientation;
+        self.persist_print_params();
         if let Some(preview) = &self.preview {
             // The reader entity is leased by this very update; the preview must
             // not call back into it or GPUI panics on the double borrow.
@@ -792,6 +825,7 @@ impl PoemReader {
             return;
         }
         self.pages_per_sheet = pages;
+        self.persist_print_params();
         if let Some(preview) = &self.preview {
             // 主窗口自己的实体正被借用着，预览不能反过来碰它。
             preview
@@ -809,6 +843,7 @@ impl PoemReader {
             return;
         }
         self.image_print = print;
+        self.persist_print_params();
         if let Some(preview) = &self.preview {
             // 主窗口自己的实体正被借用着，预览不能反过来碰它。
             preview
@@ -853,6 +888,7 @@ impl PoemReader {
             return;
         }
         self.image_print = print;
+        self.persist_print_params();
         cx.notify();
     }
 
@@ -866,6 +902,7 @@ impl PoemReader {
             return;
         }
         self.pages_per_sheet = pages;
+        self.persist_print_params();
         cx.notify();
     }
 
@@ -879,6 +916,27 @@ impl PoemReader {
             return;
         }
         self.print_orientation = orientation;
+        self.persist_print_params();
+        cx.notify();
+    }
+
+    /// 预览窗口切换了「适应纸张 / 原始大小」，记下来即可。
+    pub(crate) fn remember_print_fit(&mut self, fit: PrintFit, cx: &mut Context<Self>) {
+        if self.print_fit == fit {
+            return;
+        }
+        self.print_fit = fit;
+        self.persist_print_params();
+        cx.notify();
+    }
+
+    /// 预览窗口切换了页号开关，记下来即可。
+    pub(crate) fn remember_page_number(&mut self, page_number: bool, cx: &mut Context<Self>) {
+        if self.page_number == page_number {
+            return;
+        }
+        self.page_number = page_number;
+        self.persist_print_params();
         cx.notify();
     }
 
@@ -984,12 +1042,12 @@ impl PoemReader {
         Some(PrintJob {
             title: document.file_name.to_string(),
             content,
-            // The reader has no print controls of its own, so it prints the way
-            // the preview does by default: nothing is cut at the page edge.
-            fit: PrintFit::FitToPaper,
+            // 上一次打印怎么适应纸宽，这次还怎么印；预览里切换过就跟着变。
+            fit: self.print_fit,
             orientation: self.print_orientation,
             pages_per_sheet: self.pages_per_sheet,
             image: self.image_print,
+            page_number: self.page_number,
         })
     }
 
@@ -1819,6 +1877,23 @@ impl PoemReader {
         let base_font = window.text_style().font();
         let viewport = self.scroll_viewport(window);
         let column_width = (document.content_width * scale).max(160.0);
+        // The sheet keeps the page size and margins the document declares, so
+        // the text column sits where Word puts it instead of filling the
+        // window.
+        let page_width = document
+            .page_width
+            .map(|width| (width * scale).max(column_width))
+            .unwrap_or(column_width);
+        let (margin_left, margin_right) = if page_width > column_width + 0.5 {
+            (
+                (document.margin_left * scale).max(0.0),
+                (document.margin_right * scale).max(0.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let margin_top = (document.margin_top * scale).max(24.0);
+        let margin_bottom = (document.margin_bottom * scale).max(24.0);
         let highlight = cx.theme().selection;
 
         // The lines are rebuilt on every render, and the selection refers to
@@ -1842,13 +1917,34 @@ impl PoemReader {
                 .collect::<Vec<_>>()
         };
 
-        // Auto margins would centre a column that is wider than the window and
+        let text = div()
+            .w(px(column_width))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .children(blocks);
+        let sheet = div()
+            .w(px(page_width))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .child(div().w(px(margin_left)).flex_shrink_0())
+            .child(text)
+            .child(div().w(px(margin_right)).flex_shrink_0());
+
+        // Auto margins would centre a page that is wider than the window and
         // clip it on both sides, so wide pages start at the left edge instead.
-        let mut content = div().w(px(column_width)).flex_shrink_0().py(px(24.));
-        if column_width <= viewport.width + 0.5 {
+        let mut content = div()
+            .w(px(page_width))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .pt(px(margin_top))
+            .pb(px(margin_bottom))
+            .child(sheet);
+        if page_width <= viewport.width + 0.5 {
             content = content.mx_auto();
         }
-        let content = content.children(blocks);
 
         let mut root = div()
             .id("word-scroll-root")
@@ -1884,7 +1980,7 @@ impl PoemReader {
             );
 
         // A zoomed-in page can be wider than the window.
-        if column_width > viewport.width + 0.5 {
+        if page_width > viewport.width + 0.5 {
             root = root.child(
                 div().absolute().inset_0().child(
                     Scrollbar::horizontal(&self.scroll_handle)

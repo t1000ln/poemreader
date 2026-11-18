@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::component::{
-    IconName, Selectable as _, TitleBar, WindowExt as _,
+    Icon, IconName, Selectable as _, TitleBar, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -32,6 +32,9 @@ use crate::print::{
 };
 use crate::settings::ReadingBackground;
 use crate::{APP_ICON, PDF_PAGE_GAP, PDF_PAGE_MARGIN, PDF_TOP_PADDING};
+
+/// 页号按钮的小图标：一个字母「n」，对应页脚印的「n / m」。
+const PAGE_NUMBER_ICON: &[u8] = include_bytes!("../assets/icons/page-number.svg");
 
 /// 预览位图的分辨率。位图只用来显示，144 dpi 缩到屏幕宽度仍然清晰。
 pub(crate) const PREVIEW_DPI: f32 = 144.0;
@@ -434,6 +437,9 @@ pub(crate) struct PreviewWindow {
     counted: bool,
     /// 总页数，第一次完整排版后才知道。
     total: Option<usize>,
+    /// 文档页总数。缩印时一张纸放好几页，版面按张数排（total），而页脚
+    /// 「n / m」的 m 要用文档页数，与直接打印同一套页号，两者分开记。
+    doc_total: Option<usize>,
     /// 排版失败，界面不再重试。
     failed: bool,
     zoom: f32,
@@ -475,6 +481,7 @@ impl PreviewWindow {
             counting: false,
             counted: false,
             total: None,
+            doc_total: None,
             failed: false,
             zoom: 1.0,
             scroll_handle: ScrollHandle::new(),
@@ -507,8 +514,24 @@ impl PreviewWindow {
     ///
     /// 两种模式的页宽不同，页里的每一行也就落在别处，所以已经画好的页要全部
     /// 丢掉重排——预览仍然显示的就是按新设置打印出来的样子。
+    ///
+    /// 换过的适应方式回传给主窗口：直接打印走的是主窗口记下的那一份，这里不
+    /// 报过去的话，关掉预览再打印就又回到旧设置了。
     pub(crate) fn toggle_fit(&mut self, cx: &mut Context<Self>) {
         self.job.fit = self.job.fit.toggled();
+        self.reader
+            .update(cx, |reader, cx| reader.remember_print_fit(self.job.fit, cx))
+            .ok();
+        self.relayout(cx);
+    }
+
+    /// 页脚写不写「n / m」页号：开着的时候每一页底部都印上。
+    pub(crate) fn toggle_page_number(&mut self, cx: &mut Context<Self>) {
+        let on = !self.job.page_number;
+        self.job.page_number = on;
+        self.reader
+            .update(cx, |reader, cx| reader.remember_page_number(on, cx))
+            .ok();
         self.relayout(cx);
     }
 
@@ -796,6 +819,7 @@ impl PreviewWindow {
         self.counting = false;
         self.counted = false;
         self.total = None;
+        self.doc_total = None;
         self.failed = false;
         cx.notify();
     }
@@ -836,7 +860,7 @@ impl PreviewWindow {
                         region.page.min(u32::MAX as usize - 1) as u32 + 1,
                     )]);
                     let (_, pages) =
-                        print::render_pages(&job, scaled, dpi, &range, Some(region.page))?;
+                        print::render_pages(&job, scaled, dpi, &range, Some(region.page), None)?;
                     let (_, page) = pages
                         .into_iter()
                         .next()
@@ -859,6 +883,8 @@ impl PreviewWindow {
                             pages_per_sheet: PagesPerSheet::One,
                             // 这一张是裁下来的视图，铺满纸才是它的用途。
                             image: ImagePrint::default(),
+                            // 裁下来的不是整页，页号没有意义。
+                            page_number: false,
                         };
                         crate::run_print_job(job, window, cx);
                     })
@@ -1033,6 +1059,9 @@ impl PreviewWindow {
         let sheet = self.info.sheet;
         let generation = self.generation;
         let requested = pages.clone();
+        // 页脚的 m 是文档页总数：直接打印也是这个语义，缩印时 n 才不会
+        // 超过 m。计数这一趟是空的，无所谓。
+        let page_total = self.doc_total;
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -1040,7 +1069,7 @@ impl PreviewWindow {
                     // A document that cannot be laid out must not take the whole
                     // application down.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        print::render_pages(&job, sheet, PREVIEW_DPI, &range, stop_after)
+                        print::render_pages(&job, sheet, PREVIEW_DPI, &range, stop_after, page_total)
                     }))
                     .ok()
                     .and_then(|result| result.ok())
@@ -1101,7 +1130,9 @@ impl PreviewWindow {
         match result {
             Some((total, pages)) => {
                 if let Some(total) = total {
-                    self.total = Some(total);
+                    // render_pages 返回文档页数；预览按张排版，缩印时换算成张数。
+                    self.doc_total = Some(total);
+                    self.total = Some(total.div_ceil(self.job.pages_per_sheet.count()));
                     // 页数是完整的，就不必再单独数一遍。
                     self.counted = true;
                 }
@@ -1192,12 +1223,17 @@ impl PreviewWindow {
         let count_rest =
             ready && !failed && self.total.is_none() && !self.counting && !self.counted;
 
-        if ready && !failed && !missing.is_empty() {
+        // 页号开着就先把全文数完：页脚上的「共几页」不能用猜测值。
+        let count_first = ready && !failed && self.job.page_number && self.total.is_none();
+        if ready && !failed && !missing.is_empty() && !count_first {
             let stop_after = missing.last().copied();
             for index in &missing {
                 self.rendering.insert(*index);
             }
             self.request_pages(missing, stop_after, Work::Pages, window, cx);
+        } else if count_first && !self.counting {
+            self.counting = true;
+            self.request_pages(Vec::new(), None, Work::Count, window, cx);
         } else if count_rest {
             self.counting = true;
             self.request_pages(Vec::new(), None, Work::Count, window, cx);
@@ -1483,12 +1519,25 @@ impl PreviewWindow {
             .tooltip_show_delay(TOOLTIP_DELAY)
             .on_click(cx.listener(|this, _, _, cx| this.toggle_orientation(cx)));
 
+        // 页脚写不写页号：开着的时候每一页底部都印「n / m」。
+        let page_number = chip_button("preview-page-number")
+            .icon(Icon::default().data(PAGE_NUMBER_ICON))
+            .label("页号")
+            .selected(self.job.page_number)
+            .tooltip(if self.job.page_number {
+                "已开启：每一页底部印「页号 / 总页数」，再点一下关掉"
+            } else {
+                "打开后在每一页的底部印「页号 / 总页数」"
+            })
+            .tooltip_show_delay(TOOLTIP_DELAY)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_page_number(cx)));
+
         // 一张纸印几页，直接从菜单里选：按钮上写的就是当前的组合方式。
         let pages_per_sheet = {
             let view = cx.entity();
             let current = self.job.pages_per_sheet;
             chip_button("preview-pages")
-                
+
                 .icon(IconName::LayoutDashboard)
                 .label(current.label())
                 .tooltip("一张纸印几页：把多页缩小排在同一张纸上（缩印）")
@@ -1569,6 +1618,7 @@ impl PreviewWindow {
             .children(poster)
             .child(orientation)
             .child(pages_per_sheet)
+            .child(page_number)
             .child(divider())
             .child(print_visible)
             .child(print)
@@ -1632,6 +1682,7 @@ mod tests {
             orientation: print::Orientation::Portrait,
             pages_per_sheet: print::PagesPerSheet::One,
             image: print::ImagePrint::default(),
+            page_number: false,
         }
     }
 
@@ -1731,11 +1782,12 @@ mod tests {
             orientation: print::Orientation::Portrait,
             pages_per_sheet: print::PagesPerSheet::One,
             image: print::ImagePrint::default(),
+            page_number: false,
         };
 
         let range = PageRange::Pages(vec![(1, 1)]);
         let (total, pages) =
-            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, Some(0)).expect("render");
+            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, Some(0), None).expect("render");
 
         assert!(total.is_none(), "a stopped layout cannot know the page count");
         assert_eq!(pages.len(), 1, "only the page asked for is painted");
@@ -1759,7 +1811,7 @@ mod tests {
         ] {
             let job = job_of(&format!("samples/{name}"));
             let (total, pages) =
-                print::render_pages(&job, info.sheet, PREVIEW_DPI, &ranges, None).expect("render");
+                print::render_pages(&job, info.sheet, PREVIEW_DPI, &ranges, None, None).expect("render");
 
             assert!(
                 total.is_some_and(|total| total >= 1),
@@ -1809,11 +1861,11 @@ mod tests {
         let range = PageRange::Pages(vec![(1, 1)]);
 
         let (portrait, _) =
-            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, None).expect("portrait");
+            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, None, None).expect("portrait");
         let landscape_sheet = info
             .oriented(print::Orientation::Landscape)
             .sheet;
-        let (landscape, _) = print::render_pages(&job, landscape_sheet, PREVIEW_DPI, &range, None)
+        let (landscape, _) = print::render_pages(&job, landscape_sheet, PREVIEW_DPI, &range, None, None)
             .expect("landscape");
 
         let portrait = portrait.expect("the whole table was measured");

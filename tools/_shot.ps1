@@ -16,7 +16,7 @@ public class Ui2 {
 "@
 Get-Process poemreader -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
-if ($File) { $p = Start-Process -FilePath $Run -ArgumentList $File -PassThru }
+if ($File) { $p = Start-Process -FilePath $Run -ArgumentList ('"{0}"' -f $File) -PassThru }
 else { $p = Start-Process -FilePath $Run -PassThru }
 Start-Sleep -Milliseconds $Wait
 $p.Refresh()

@@ -34,6 +34,16 @@ pub struct WordDocument {
     pub blocks: Vec<Block>,
     /// Width of the text column, in points, taken from the section properties.
     pub content_width: f32,
+    /// Width of the page itself, in points, when the file declares one.
+    pub page_width: Option<f32>,
+    /// Left margin of the page, in points.
+    pub margin_left: f32,
+    /// Right margin of the page, in points.
+    pub margin_right: f32,
+    /// Top margin of the page, in points.
+    pub margin_top: f32,
+    /// Bottom margin of the page, in points.
+    pub margin_bottom: f32,
     /// Paragraphs in the body and in table cells, for the status bar.
     pub paragraphs: usize,
 }
@@ -102,7 +112,14 @@ impl Paragraph {
         if sizes.clone().all(|size| (size - first).abs() < 0.05) {
             first
         } else {
-            sizes.fold(first, f32::max).max(self.size)
+            // One size per paragraph: use the size of the first real text.
+            // Documents pad lines with runs of spaces that carry another size,
+            // and drawing everything at the largest size would wrap wrongly.
+            self.runs
+                .iter()
+                .find(|run| run.image.is_none() && !run.text.trim().is_empty())
+                .and_then(|run| run.size)
+                .unwrap_or(self.size)
         }
     }
 }
@@ -137,13 +154,113 @@ pub struct Table {
     pub rows: Vec<Vec<TableCell>>,
     /// Column widths in points, from `w:tblGrid`.
     pub columns: Vec<f32>,
+    /// Minimum row heights in points, from `w:trHeight` or `sprmPHt`; zero
+    /// means the row is only as tall as its contents.
+    pub row_heights: Vec<f32>,
     pub borders: bool,
+    /// Horizontal offset of the table from the text margin, in points;
+    /// negative pulls the table into the left margin.
+    pub indent: f32,
+}
+
+/// Vertical alignment of the contents inside a table cell.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum VAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
 }
 
 pub struct TableCell {
+    /// Columns the cell occupies, from `w:gridSpan` or a vertical merge's
+    /// restart flags.
     pub span: usize,
+    /// True when this cell starts a vertical merge. `row_span` is resolved
+    /// from this flag and the covered cells below by [`Table::resolve_row_spans`].
+    pub merge_start: bool,
+    /// True when this cell continues a vertical merge started above; it holds
+    /// no content and only extends the merged area's borders.
+    pub covered: bool,
+    /// Rows the cell covers, one more than the covered cells below it.
+    pub row_span: usize,
+    /// Where the contents sit inside the cell, from `w:vAlign` or the TCGRF
+    /// vertical-alignment bits.
+    pub v_align: VAlign,
     pub fill: Option<u32>,
     pub blocks: Vec<Block>,
+}
+
+impl Table {
+    /// Turns vertical-merge marks into row spans: the cell that starts a merge
+    /// gets the number of rows its covered continuations reach, so renderers
+    /// can draw the merged area as one cell.
+    pub(crate) fn resolve_row_spans(&mut self) {
+        // The column each cell starts at, per row, so covered cells can be
+        // matched with the cell above them.
+        let starts: Vec<Vec<usize>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let mut column = 0usize;
+                row.iter()
+                    .map(|cell| {
+                        let start = column;
+                        column += cell.span.max(1);
+                        start
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // A continuation is only real when a merge is open in its column;
+        // otherwise the file is malformed and the cell stays a plain cell.
+        let mut open: HashMap<usize, ()> = HashMap::new();
+        for row_index in 0..self.rows.len() {
+            for cell_index in 0..self.rows[row_index].len() {
+                let start = starts[row_index][cell_index];
+                let (merge_start, covered) = {
+                    let cell = &self.rows[row_index][cell_index];
+                    (cell.merge_start, cell.covered)
+                };
+                if merge_start {
+                    open.insert(start, ());
+                } else if covered {
+                    if !open.contains_key(&start) {
+                        self.rows[row_index][cell_index].covered = false;
+                    }
+                } else {
+                    open.remove(&start);
+                }
+            }
+        }
+
+        for row_index in 0..self.rows.len() {
+            for cell_index in 0..self.rows[row_index].len() {
+                if !self.rows[row_index][cell_index].merge_start {
+                    continue;
+                }
+                let start = starts[row_index][cell_index];
+                let mut rows = 1usize;
+                for below in row_index + 1..self.rows.len() {
+                    let covers = self.rows[below]
+                        .iter()
+                        .enumerate()
+                        .find(|(index, cell)| {
+                            let cell_start = starts[below][*index];
+                            cell_start <= start && start < cell_start + cell.span.max(1)
+                        })
+                        .map(|(_, cell)| cell.covered)
+                        .unwrap_or(false);
+                    if !covers {
+                        break;
+                    }
+                    rows += 1;
+                }
+                self.rows[row_index][cell_index].row_span = rows;
+            }
+        }
+    }
 }
 
 /// Parse a `.docx` package.
@@ -167,12 +284,67 @@ pub fn load(package: &Package) -> Result<WordDocument, String> {
     let mut context = Context {
         styles,
         numbering,
-        package,
         rels: package.rels("word/document.xml"),
         images: HashMap::new(),
+        rotated: HashMap::new(),
         counters: HashMap::new(),
         content_width: DEFAULT_CONTENT_WIDTH,
+        page_width: None,
+        margin_left: 0.0,
+        margin_right: 0.0,
+        margin_top: 0.0,
+        margin_bottom: 0.0,
     };
+
+    // Which pictures the body draws rotated: baking the rotation costs as
+    // much as the pixel count, so it happens here too, off-thread, instead of
+    // serially while the body is walked.
+    let mut rotations: HashMap<String, Vec<i32>> = HashMap::new();
+    collect_rotations(&document, &mut rotations);
+
+    let decoded: Vec<(String, Option<DecodedImage>, Vec<(i32, DecodedImage)>)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = context
+                .rels
+                .iter()
+                .filter(|(_, path)| path.contains("media/"))
+                .filter_map(|(id, path)| {
+                    let bytes = package.bytes(path)?.to_vec();
+                    let degrees = rotations.get(id).cloned().unwrap_or_default();
+                    Some((
+                        id.clone(),
+                        scope.spawn(move || {
+                            let base = decode_image(&bytes);
+                            let baked = base
+                                .as_ref()
+                                .map(|base| {
+                                    degrees
+                                        .iter()
+                                        .map(|degrees| (*degrees, bake(base, *degrees)))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            (base, baked)
+                        }),
+                    ))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|(id, handle)| {
+                    let (base, baked) = handle.join().unwrap_or((None, Vec::new()));
+                    (id, base, baked)
+                })
+                .collect()
+        });
+    for (id, base, baked) in decoded {
+        if base.is_some() {
+            context.images.insert(id.clone(), base);
+        }
+        for (degrees, image) in baked {
+            context.rotated.insert((id.clone(), degrees), Some(image));
+        }
+    }
 
     let body = document
         .child("body")
@@ -186,6 +358,11 @@ pub fn load(package: &Package) -> Result<WordDocument, String> {
     Ok(WordDocument {
         blocks,
         content_width: context.content_width,
+        page_width: context.page_width,
+        margin_left: context.margin_left,
+        margin_right: context.margin_right,
+        margin_top: context.margin_top,
+        margin_bottom: context.margin_bottom,
         paragraphs,
     })
 }
@@ -205,17 +382,26 @@ fn count_paragraphs(blocks: &[Block]) -> usize {
         .sum()
 }
 
-struct Context<'a> {
+struct Context {
     styles: Styles,
     numbering: Numbering,
-    package: &'a Package,
     rels: HashMap<String, String>,
     images: HashMap<String, Option<DecodedImage>>,
+    /// Rotation-baked copies of decoded images, keyed by relationship id and
+    /// angle: baking is proportional to the pixel count and a picture
+    /// referenced several times must not be rotated again per reference.
+    rotated: HashMap<(String, i32), Option<DecodedImage>>,
     counters: HashMap<(String, usize), u32>,
     content_width: f32,
+    /// Page width and side margins of the section, in points.
+    page_width: Option<f32>,
+    margin_left: f32,
+    margin_right: f32,
+    margin_top: f32,
+    margin_bottom: f32,
 }
 
-impl Context<'_> {
+impl Context {
     /// Paragraphs and tables of a container, in order.
     fn blocks_of(&mut self, node: &Node) -> Vec<Block> {
         let mut blocks = Vec::new();
@@ -254,7 +440,20 @@ impl Context<'_> {
             .unwrap_or(1440.0);
         let width = (width - left - right) / TWIPS_PER_POINT;
         if width > 120.0 {
+            let top = margins
+                .and_then(|mar| mar.attr("top"))
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(1440.0);
+            let bottom = margins
+                .and_then(|mar| mar.attr("bottom"))
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(1440.0);
             self.content_width = width;
+            self.page_width = Some(width + (left + right) / TWIPS_PER_POINT);
+            self.margin_left = left / TWIPS_PER_POINT;
+            self.margin_right = right / TWIPS_PER_POINT;
+            self.margin_top = top / TWIPS_PER_POINT;
+            self.margin_bottom = bottom / TWIPS_PER_POINT;
         }
     }
 
@@ -285,7 +484,7 @@ impl Context<'_> {
             italic: run_style.italic.unwrap_or(false),
             runs: Vec::new(),
             border: ParagraphBorder::default(),
-            fill: None,
+            fill: para.fill,
         };
 
         if paragraph.marker.is_some() {
@@ -329,6 +528,14 @@ impl Context<'_> {
                     }
                 }
                 "drawing" | "pict" | "object" => {
+                    // A freely floating image (no text wrap) is positioned by
+                    // page coordinates the reader does not reproduce, so
+                    // inlining it would only drop a stray box into the flow.
+                    let floating = child.descendant("anchor").is_some()
+                        && child.descendant("wrapNone").is_some();
+                    if floating {
+                        continue;
+                    }
                     if !text.is_empty() {
                         runs.push(props.to_run(std::mem::take(&mut text)));
                     }
@@ -372,8 +579,29 @@ impl Context<'_> {
                     .and_then(|properties| properties.child("shd"))
                     .and_then(|shading| shading.attr("fill"))
                     .and_then(|value| parse_hex_color(&value));
+                // `<w:vMerge/>` without a value continues a merge; only
+                // "restart" marks the cell that starts one.
+                let merge = properties.and_then(|properties| properties.child("vMerge"));
+                let merge_start = merge
+                    .and_then(|merge| merge.attr("val"))
+                    .map(|value| value == "restart")
+                    .unwrap_or(false);
+                let covered = merge.is_some() && !merge_start;
+                let v_align = properties
+                    .and_then(|properties| properties.child("vAlign"))
+                    .and_then(|align| align.attr("val"))
+                    .map(|value| match value.as_str() {
+                        "center" => VAlign::Center,
+                        "bottom" => VAlign::Bottom,
+                        _ => VAlign::Top,
+                    })
+                    .unwrap_or_default();
                 cells.push(TableCell {
                     span,
+                    merge_start,
+                    covered,
+                    row_span: 1,
+                    v_align,
                     fill,
                     blocks: self.blocks_of(cell),
                 });
@@ -403,25 +631,66 @@ impl Context<'_> {
             .and_then(|properties| properties.child("tblBorders"))
             .is_some();
 
-        Table {
+        // Minimum row heights: `w:trHeight` is a dxa value; without an
+        // "exact" rule the row grows past it when the contents need more.
+        let row_heights: Vec<f32> = node
+            .children_named("tr")
+            .map(|row| {
+                row.child("trPr")
+                    .and_then(|properties| properties.child("trHeight"))
+                    .and_then(|height| height.attr("val"))
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .map(|twips| twips / TWIPS_PER_POINT)
+                    .unwrap_or(0.0)
+            })
+            .collect();
+
+        let mut table = Table {
+            indent: node
+                .child("tblPr")
+                .and_then(|pr| pr.child("tblInd"))
+                .and_then(|ind| ind.attr("w"))
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                / TWIPS_PER_POINT,
             rows,
             columns,
+            row_heights,
             borders,
-        }
+        };
+        table.resolve_row_spans();
+        table
     }
 
     /// The image of a drawing, decoded once per relationship id.
     fn image(&mut self, node: &Node) -> Option<InlineImage> {
         let blip = node.descendant("blip")?;
-        let id = blip.attr("embed").or_else(|| blip.attr("link"))?;
-        let path = self.rels.get(&id)?.clone();
+        let id = blip.attr("embed").or_else(|| blip.attr("link"))?.to_owned();
 
-        let decoded = match self.images.get(&id) {
-            Some(image) => image.clone(),
-            None => {
-                let decoded = self.package.bytes(&path).and_then(decode_image);
-                self.images.insert(id.clone(), decoded.clone());
-                decoded
+        // DrawingML may rotate the whole picture clockwise in 60 000ths of a
+        // degree; the stored raster is upright, so the rotation is baked in
+        // and the extent swapped to match. Baking costs as much as the pixel
+        // count, so the baked copy is cached per picture and angle.
+        let degrees = node
+            .descendant("xfrm")
+            .and_then(|xfrm| xfrm.attr("rot"))
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|value| ((value / 60000.0).round() as i32).rem_euclid(360))
+            .unwrap_or(0);
+        let decoded = if degrees == 0 {
+            self.images.get(&id)?.clone()
+        } else {
+            match self.rotated.get(&(id.clone(), degrees)) {
+                Some(rotated) => rotated.clone(),
+                // Missed the predecode (an unusual angle, or the drawing is
+                // written in a shape the scan does not recognise): bake here.
+                None => {
+                    let base = self.images.get(&id)?.clone()?;
+                    let baked = bake(&base, degrees);
+                    self.rotated
+                        .insert((id.clone(), degrees), Some(baked.clone()));
+                    Some(baked)
+                }
             }
         }?;
 
@@ -443,7 +712,7 @@ impl Context<'_> {
             None => (None, None),
         };
 
-        let (width, height) = match (width, height) {
+        let (mut width, mut height) = match (width, height) {
             (Some(width), Some(height)) if width >= 1.0 && height >= 1.0 => {
                 (width / EMU_PER_POINT, height / EMU_PER_POINT)
             }
@@ -455,6 +724,9 @@ impl Context<'_> {
                 )
             }
         };
+        if degrees % 180 == 90 {
+            std::mem::swap(&mut width, &mut height);
+        }
 
         Some(InlineImage {
             image,
@@ -471,13 +743,57 @@ struct DecodedImage {
     pixels: Arc<RgbaImage>,
 }
 
+/// One rotation-baked copy of a decoded image: the pixels turned, and the
+/// BGRA copy the window draws its texture from.
+fn bake(base: &DecodedImage, degrees: i32) -> DecodedImage {
+    let mut rotated = base.pixels.as_ref().clone();
+    let rotated = match degrees {
+        90 => image::imageops::rotate90(&rotated),
+        180 => {
+            image::imageops::rotate180_in_place(&mut rotated);
+            rotated
+        }
+        270 => image::imageops::rotate270(&rotated),
+        _ => rotated,
+    };
+    let display = crate::picture::to_render_pixels_copy(&rotated);
+    DecodedImage {
+        render: Arc::new(RenderImage::new(vec![Frame::new(display)])),
+        pixels: Arc::new(rotated),
+    }
+}
+
+/// Pictures the body draws rotated, as relationship id -> every angle they
+/// are drawn at. Only non-zero angles are collected; the parallel predecode
+/// bakes these before the body is walked.
+fn collect_rotations(node: &Node, out: &mut HashMap<String, Vec<i32>>) {
+    if matches!(node.name.as_str(), "drawing" | "pict") {
+        if let Some(id) = node
+            .descendant("blip")
+            .and_then(|blip| blip.attr("embed").or_else(|| blip.attr("link")))
+        {
+            let degrees = node
+                .descendant("xfrm")
+                .and_then(|xfrm| xfrm.attr("rot"))
+                .and_then(|value| value.parse::<f32>().ok())
+                .map(|value| ((value / 60000.0).round() as i32).rem_euclid(360))
+                .unwrap_or(0);
+            if degrees != 0 {
+                out.entry(id.to_owned()).or_default().push(degrees);
+            }
+        }
+    }
+    for child in &node.children {
+        collect_rotations(child, out);
+    }
+}
+
 fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
     let image = image::load_from_memory(bytes).ok()?;
     let pixels = image.to_rgba8();
     // The window reads a texture as BGRA, so the copy it draws is converted;
     // the printer keeps the straight RGBA one.
-    let mut display = pixels.clone();
-    crate::picture::to_render_pixels(&mut display);
+    let display = crate::picture::to_render_pixels_copy(&pixels);
     let render = RenderImage::new(vec![Frame::new(display)]);
     Some(DecodedImage {
         render: Arc::new(render),
@@ -539,6 +855,8 @@ struct ParaProps {
     line_spacing: Option<f32>,
     num_id: Option<String>,
     level: Option<usize>,
+    /// Paragraph shading fill, RGB; `w:fill="auto"` reads as none.
+    fill: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -738,6 +1056,12 @@ fn paragraph_props(node: &Node) -> ParaProps {
                     .and_then(|node| node.attr("val"))
                     .and_then(|value| value.parse::<usize>().ok());
             }
+            "shd" => {
+                props.fill = child
+                    .attr("fill")
+                    .filter(|value| !value.eq_ignore_ascii_case("auto"))
+                    .and_then(|value| parse_hex_color(&value));
+            }
             _ => {}
         }
     }
@@ -771,7 +1095,8 @@ fn merge_para(mut base: ParaProps, over: ParaProps) -> ParaProps {
         space_after,
         line_spacing,
         num_id,
-        level
+        level,
+        fill
     );
     base
 }
@@ -965,3 +1290,55 @@ fn chinese_number(value: u32) -> String {
         _ => value.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(merge_start: bool, covered: bool) -> TableCell {
+        TableCell {
+            span: 1,
+            merge_start,
+            covered,
+            row_span: 1,
+            v_align: VAlign::Top,
+            fill: None,
+            blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_merge_covers_the_flagged_cells_below() {
+        let mut table = Table {
+            rows: vec![
+                vec![cell(true, false), cell(false, false)],
+                vec![cell(false, true), cell(false, false)],
+                vec![cell(false, true), cell(false, false)],
+                vec![cell(false, false), cell(false, false)],
+            ],
+            columns: vec![60.0; 2],
+            row_heights: Vec::new(),
+            borders: true,
+            indent: 0.0,
+        };
+        table.resolve_row_spans();
+        assert_eq!(table.rows[0][0].row_span, 3);
+        assert!(table.rows[1][0].covered && table.rows[2][0].covered);
+        assert_eq!(table.rows[3][0].row_span, 1);
+        assert!(!table.rows[3][0].covered);
+    }
+
+    #[test]
+    fn a_continuation_without_a_merge_above_is_a_plain_cell() {
+        let mut table = Table {
+            rows: vec![vec![cell(false, false), cell(false, true)]],
+            columns: vec![60.0; 2],
+            row_heights: Vec::new(),
+            borders: true,
+            indent: 0.0,
+        };
+        table.resolve_row_spans();
+        assert!(!table.rows[0][1].covered);
+    }
+}
+

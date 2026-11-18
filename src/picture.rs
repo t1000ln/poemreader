@@ -246,6 +246,22 @@ pub(crate) fn to_render_pixels(pixels: &mut RgbaImage) {
     }
 }
 
+/// The same pre-multiplied BGRA conversion, into a fresh buffer — one pass
+/// instead of clone followed by an in-place conversion.
+pub(crate) fn to_render_pixels_copy(pixels: &RgbaImage) -> RgbaImage {
+    let (width, height) = pixels.dimensions();
+    let mut out = RgbaImage::new(width, height);
+    for (src, dst) in pixels.pixels().zip(out.pixels_mut()) {
+        let (r, g, b, a) = (src.0[0], src.0[1], src.0[2], src.0[3]);
+        let alpha = a as u32;
+        dst.0[0] = ((b as u32 * alpha + 127) / 255) as u8;
+        dst.0[1] = ((g as u32 * alpha + 127) / 255) as u8;
+        dst.0[2] = ((r as u32 * alpha + 127) / 255) as u8;
+        dst.0[3] = a;
+    }
+    out
+}
+
 fn swap_red_blue(data: &mut [u8]) {
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);

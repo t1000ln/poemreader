@@ -4909,12 +4909,14 @@ dependencies = [
  "flate2",
  "gpui-kit",
  "hayro",
+ "icu_segmenter",
  "image",
  "markdown",
  "quick-xml",
  "resvg 0.46.0",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "windows 0.62.2",
 ]
 

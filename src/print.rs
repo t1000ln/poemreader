@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
 use crate::excel::Workbook;
 use crate::pdf::PdfSource;
@@ -46,6 +47,8 @@ pub struct PrintJob {
     pub pages_per_sheet: PagesPerSheet,
     /// How a picture is printed: size, anchor and poster paging.
     pub image: ImagePrint,
+    /// Whether every page carries a "n / m" footer.
+    pub page_number: bool,
 }
 
 /// Which way round the sheet is printed.
@@ -53,7 +56,8 @@ pub struct PrintJob {
 /// The choice belongs to the job rather than to the printer: the layout is
 /// measured against the printable area, so a wider page really does fit more
 /// on a line, and the preview has to be laid out the same way.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Orientation {
     #[default]
     Portrait,
@@ -83,7 +87,8 @@ impl Orientation {
 /// Word and Excel layouts are driven by the paper they are drawn on, so a
 /// document authored for a wider sheet would otherwise be cut at the right
 /// edge of the page.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrintFit {
     /// Shrink the layout until every column, table and picture fits the paper.
     #[default]
@@ -117,8 +122,8 @@ impl PrintFit {
 /// picture itself. The percentage is of the size that fits the paper, so 100%
 /// fills the sheet the way an unscaled print always has: larger is centred and
 /// cut at the printable edge, smaller sits in the middle of a white page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageScale(u32);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageScale(pub(crate) u32);
 
 impl Default for ImageScale {
     fn default() -> Self {
@@ -165,7 +170,7 @@ impl ImageScale {
 /// Both components are 0–1: 0 is the left or top edge, 1 the right or bottom,
 /// 0.5 the middle. A fraction rather than a distance is kept so the anchor
 /// stays on the same place of the picture when the paper or the scale changes.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImageAnchor {
     pub x: f32,
     pub y: f32,
@@ -188,7 +193,7 @@ impl ImageAnchor {
 }
 
 /// How a picture is printed: how large, from where, and on how many pages.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImagePrint {
     /// How large the picture is drawn on the paper.
     pub scale: ImageScale,
@@ -271,7 +276,8 @@ pub(crate) fn image_origin(
 /// The pages keep the layout they have on their own sheet and are scaled down,
 /// so a letter still breaks its lines where the letter does; only the paper
 /// they land on carries more of them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PagesPerSheet {
     #[default]
     One,
@@ -531,14 +537,15 @@ pub fn render_pages(
     dpi: f32,
     range: &PageRange,
     stop_after: Option<usize>,
+    page_total: Option<usize>,
 ) -> Result<RenderedPages, String> {
     #[cfg(windows)]
     {
-        imp::render_pages(job, sheet, dpi, range, stop_after)
+        imp::render_pages(job, sheet, dpi, range, stop_after, page_total)
     }
     #[cfg(not(windows))]
     {
-        let _ = (job, sheet, dpi, range, stop_after);
+        let _ = (job, sheet, dpi, range, stop_after, page_total);
         Err(String::from("当前平台暂不支持打印预览"))
     }
 }
@@ -552,14 +559,36 @@ mod surface {
     use std::mem::size_of;
 
     use image::RgbaImage;
+    use windows::core::w;
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
-        BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GdiFlush, GetDC, HALFTONE, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
-        SRCCOPY, SelectObject, SetBrushOrgEx, SetStretchBltMode, SetViewportOrgEx, StretchDIBits,
+        BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
+        CreateFontW, DEFAULT_CHARSET, DeleteDC, DeleteObject, DIB_RGB_COLORS, GdiFlush, GetDC,
+        GetTextExtentPoint32W, HALFTONE, HBITMAP, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS,
+        PROOF_QUALITY, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetBrushOrgEx,
+        SetStretchBltMode, SetTextColor, SetViewportOrgEx, StretchDIBits, TRANSPARENT, TextOutW,
     };
     use windows::Win32::Storage::Xps::{EndPage, StartPage};
 
     use super::SheetGeometry;
+
+    /// How far above the bottom of the printable area the page number sits,
+    /// in inches.
+    const FOOTER_INSET_INCHES: f32 = 0.35;
+    /// The page number is drawn in a muted grey, like a footer.
+    const FOOTER_COLOR: COLORREF = COLORREF(0x00808080);
+
+    /// The "n / m" footer stamped on every page when page numbers are on.
+    struct Footer {
+        /// Total number of document pages.
+        total: usize,
+        /// Printable area of the target, in device pixels. Sheet devices know
+        /// their own paper, so this is only read when printing directly.
+        printable: (i32, i32),
+        /// Device pixels per inch, for the font and the inset.
+        dpi: i32,
+    }
 
     /// Where a page is painted.
     ///
@@ -571,6 +600,8 @@ mod surface {
         /// Pages are painted on a sheet of their own first and shrunk onto the
         /// real one, several at a time.
         shrink: Option<Shrink>,
+        /// Page numbers to stamp on every finished page, when enabled.
+        footer: Option<Footer>,
     }
 
     /// An off-screen sheet that pages are painted onto and read back from.
@@ -706,6 +737,7 @@ mod surface {
                 hdc,
                 sheet: None,
                 shrink: None,
+                footer: None,
             }
         }
 
@@ -720,6 +752,7 @@ mod surface {
                 hdc: sheet.dc,
                 sheet: Some(sheet),
                 shrink: None,
+                footer: None,
             })
         }
 
@@ -758,6 +791,24 @@ mod surface {
             self.sheet.as_ref().map(|sheet| sheet.dc).unwrap_or(self.hdc)
         }
 
+        /// Stamp an "n / m" footer on every page that gets finished.
+        ///
+        /// `printable` is the target's printable area in device pixels; sheet
+        /// and shrink devices draw on a paper-sized page of their own, so they
+        /// take their geometry from that page instead.
+        pub(crate) fn enable_page_numbers(
+            &mut self,
+            total: usize,
+            printable: (i32, i32),
+            dpi: i32,
+        ) {
+            self.footer = Some(Footer {
+                total,
+                printable,
+                dpi,
+            });
+        }
+
         /// Begin page `index`.
         pub(crate) fn start_page(&mut self, index: usize) -> Result<(), String> {
             let _ = index;
@@ -770,10 +821,83 @@ mod surface {
 
         /// Finish page `index`, keeping it if this is a sheet.
         pub(crate) fn end_page(&mut self, index: usize) -> Result<(), String> {
+            if self.footer.is_some() {
+                self.draw_footer(index)?;
+            }
             if self.shrink.is_some() {
                 return self.compose();
             }
             self.finish_sheet(index)
+        }
+
+        /// Draw the "n / m" footer of page `index` on the page just painted.
+        ///
+        /// The page is still open, so the footer joins the content the layout
+        /// functions have already drawn — on a shrink device it lands on the
+        /// full-size page and shrinks into its slot together with it.
+        fn draw_footer(&mut self, index: usize) -> Result<(), String> {
+            let footer = self.footer.as_ref().expect("footer checked by the caller");
+            let hdc = self.hdc();
+
+            // Where the bottom of the printable area sits, and where its
+            // centre is. On a sheet the drawing origin sits at the printable
+            // area, so the paper size has the origin subtracted again.
+            let (bottom, center_x) = if let Some(shrink) = self.shrink.as_ref() {
+                (
+                    shrink.source.height as i32 - shrink.source.origin.1,
+                    shrink.source.width as i32 / 2 - shrink.source.origin.0,
+                )
+            } else if let Some(sheet) = self.sheet.as_ref() {
+                (
+                    sheet.height as i32 - sheet.origin.1,
+                    sheet.width as i32 / 2 - sheet.origin.0,
+                )
+            } else {
+                (
+                    footer.printable.1,
+                    footer.printable.0 / 2,
+                )
+            };
+
+            let line_height = ((footer.dpi as f32 * 9.0 / 72.0).round() as i32).max(1);
+            let font = unsafe {
+                CreateFontW(
+                    -line_height,
+                    0,
+                    0,
+                    0,
+                    400, // FW_NORMAL
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    PROOF_QUALITY,
+                    0,
+                    w!("Microsoft YaHei"),
+                )
+            };
+            if font.0.is_null() {
+                return Ok(());
+            }
+            let previous = unsafe { SelectObject(hdc, HGDIOBJ(font.0)) };
+            let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
+            let _ = unsafe { SetTextColor(hdc, FOOTER_COLOR) };
+
+            let text = format!("{} / {}", index + 1, footer.total);
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let mut extent = SIZE::default();
+            let _ = unsafe { GetTextExtentPoint32W(hdc, &utf16, &mut extent) };
+
+            let inset = (footer.dpi as f32 * FOOTER_INSET_INCHES).round() as i32;
+            let x = (center_x - extent.cx / 2).max(0);
+            let y = (bottom - inset - line_height).max(0);
+            let _ = unsafe { TextOutW(hdc, x, y, &utf16) };
+
+            unsafe { SelectObject(hdc, previous) };
+            let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
+            Ok(())
         }
 
         /// Close the sheet that is still being filled, if any.
@@ -959,9 +1083,9 @@ mod imp {
         BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET,
         DIB_RGB_COLORS, DEVMODEW, DMORIENT_LANDSCAPE, DMORIENT_PORTRAIT, DM_ORIENTATION, DeleteDC,
         DeleteObject, GetDeviceCaps, GetTextExtentExPointW, GetTextExtentPoint32W, HDC, HFONT,
-        HGDIOBJ, HORZRES, LOGPIXELSX, LOGPIXELSY, OUT_DEFAULT_PRECIS, PROOF_QUALITY, ResetDCW,
-        SRCCOPY, SelectObject, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT, TextOutW,
-        VERTRES,
+        HGDIOBJ, HORZRES, LOGPIXELSX, LOGPIXELSY, OUT_DEFAULT_PRECIS, PHYSICALOFFSETX,
+        PHYSICALOFFSETY, PROOF_QUALITY, ResetDCW, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+        StretchDIBits, TRANSPARENT, TextOutW, VERTRES,
     };
     use windows::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, StartDocW};
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
@@ -999,9 +1123,79 @@ mod imp {
         let dpi_y = unsafe { GetDeviceCaps(Some(hdc), LOGPIXELSY) }.max(96);
         let width = unsafe { GetDeviceCaps(Some(hdc), HORZRES) };
         let height = unsafe { GetDeviceCaps(Some(hdc), VERTRES) };
+        // Where the printable area starts on the paper, so documents can sit
+        // at their own margins.
+        let hardware = (
+            unsafe { GetDeviceCaps(Some(hdc), PHYSICALOFFSETX) },
+            unsafe { GetDeviceCaps(Some(hdc), PHYSICALOFFSETY) },
+        );
         if width <= 0 || height <= 0 {
             return Err(String::from("打印机没有报告可打印区域"));
         }
+
+        // 页号要写 "n / m"，总数得先知道。PDF 和单页图片本来就数得出来；其余
+        // 格式排到最后一页才知道，先跑一遍不落墨的排版把总数数出来。
+        let footer_total = if job.page_number {
+            Some(match known_pages {
+                Some(total) => total,
+                None => {
+                    let empty = PageRange::Pages(Vec::new());
+                    let mut probe = Device::printer(hdc);
+                    let outcome = match &job.content {
+                        PrintContent::Text { text, font_pt } => print_text(
+                            &mut probe,
+                            text,
+                            *font_pt,
+                            width,
+                            height,
+                            dpi_x,
+                            dpi_y,
+                            &empty,
+                            None,
+                        )?,
+                        PrintContent::Pdf(source) => {
+                            print_pdf(&mut probe, source, width, height, dpi_x, dpi_y, &empty)?
+                        }
+                        PrintContent::Word(document) => crate::print_office::print_word(
+                            &mut probe,
+                            document,
+                            width,
+                            height,
+                            dpi_x,
+                            dpi_y,
+                            hardware,
+                            &empty,
+                            None,
+                            job.fit,
+                        )?,
+                        PrintContent::Excel(workbook) => crate::print_office::print_excel(
+                            &mut probe,
+                            workbook,
+                            width,
+                            height,
+                            dpi_x,
+                            dpi_y,
+                            &empty,
+                            None,
+                            job.fit,
+                        )?,
+                        PrintContent::Image { pixels } => crate::print_office::print_image(
+                            &mut probe,
+                            pixels,
+                            width,
+                            height,
+                            dpi_x,
+                            dpi_y,
+                            &empty,
+                            job.image,
+                        )?,
+                    };
+                    outcome.summary.total.max(1)
+                }
+            })
+        } else {
+            None
+        };
 
         let mut doc_name: Vec<u16> = job.title.encode_utf16().collect();
         doc_name.push(0);
@@ -1022,6 +1216,9 @@ mod imp {
         let count = job.pages_per_sheet.count();
         let grid = job.pages_per_sheet.grid(width > height);
         let mut device = Device::printer(hdc);
+        if let Some(total) = footer_total {
+            device.enable_page_numbers(total, (width, height), dpi_x);
+        }
         if count > 1 {
             device = device.shrink_onto(grid, (width, height))?;
         }
@@ -1048,6 +1245,7 @@ mod imp {
                 height,
                 dpi_x,
                 dpi_y,
+                hardware,
                 &range,
                 None,
                 job.fit,
@@ -1105,6 +1303,7 @@ mod imp {
         dpi: f32,
         range: &PageRange,
         stop_after: Option<usize>,
+        page_total: Option<usize>,
     ) -> Result<RenderedPages, String> {
         let count = job.pages_per_sheet.count();
         let mut device = Device::sheet(sheet)?;
@@ -1129,6 +1328,15 @@ mod imp {
         let width = sheet.printable_width;
         let height = sheet.printable_height;
 
+        // 页号开着就盖在每一页下面；总数由调用方给出——预览会先把全文数完。
+        if job.page_number && page_total.is_some() {
+            device.enable_page_numbers(
+                page_total.expect("checked above"),
+                (width, height),
+                dpi,
+            );
+        }
+
         let outcome = match &job.content {
             PrintContent::Text { text, font_pt } => print_text(
                 &mut device,
@@ -1151,6 +1359,7 @@ mod imp {
                 height,
                 dpi,
                 dpi,
+                (sheet.origin_x, sheet.origin_y),
                 range,
                 stop_after,
                 job.fit,
@@ -1180,9 +1389,9 @@ mod imp {
 
         // A last sheet that is not full still holds pages.
         device.finish()?;
-        let total = outcome
-            .complete
-            .then(|| outcome.summary.total.div_ceil(count));
+        // 返回文档页数：页脚「n / m」的 m 与直接打印同用一套页号，缩印时
+        // 由调用方按张数换算。
+        let total = outcome.complete.then(|| outcome.summary.total);
         Ok((total, device.into_pages()))
     }
 
@@ -1898,6 +2107,7 @@ mod tests {
             orientation: Orientation::Portrait,
             pages_per_sheet: PagesPerSheet::One,
             image: ImagePrint::default(),
+            page_number: false,
         }
     }
 
@@ -1968,14 +2178,15 @@ mod tests {
     fn four_pages_share_one_sheet() {
         let sheet = SheetGeometry::without_margins(600, 800);
         let mut job = text_job(160);
-        let (total, _) = render_pages(&job, sheet, 96.0, &PageRange::All, None).expect("layout");
+        let (total, _) = render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
         let pages = total.expect("the whole document was laid out");
         assert!(pages >= 4, "the sample has to fill more than one sheet");
 
         job.pages_per_sheet = PagesPerSheet::Four;
         let (total, sheets) =
-            render_pages(&job, sheet, 96.0, &PageRange::All, None).expect("layout");
-        assert_eq!(total, Some(pages.div_ceil(4)), "four pages per sheet");
+            render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+        // 返回的是文档页数，张数由调用方换算。
+        assert_eq!(total, Some(pages), "the total counts document pages");
         assert_eq!(sheets.len(), pages.div_ceil(4));
 
         // Every quadrant of the first sheet carries the text of one page.
@@ -1999,9 +2210,63 @@ mod tests {
         // Ask for the first sheet only: the pages of the last one are never
         // laid out, and the sheet that was started still has to be finished.
         let (_, sheets) =
-            render_pages(&job, sheet, 96.0, &PageRange::Pages(vec![(1, 1)]), Some(0))
+            render_pages(&job, sheet, 96.0, &PageRange::Pages(vec![(1, 1)]), Some(0), None)
                 .expect("layout");
         assert_eq!(sheets.len(), 1, "one sheet was asked for and one came back");
         assert!(has_ink(&sheets[0].1, 0, 0, 100, 100), "and it is painted");
+    }
+
+    #[test]
+    fn a_page_number_is_stamped_at_the_bottom() {
+        let sheet = SheetGeometry::without_margins(600, 800);
+        let mut job = text_job(20);
+        // 页脚落在下边距里：正文到不了这里，有墨迹就只能是页号。
+        let footer = (200, 748, 200, 24);
+
+        let (total, plain) =
+            render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+        let (_, page) = &plain[0];
+        assert_eq!(total, Some(1), "the sample fits one page");
+        assert!(
+            !has_ink(page, footer.0, footer.1, footer.2, footer.3),
+            "没有页号时页面底部是干净的"
+        );
+
+        job.page_number = true;
+        let (_, numbered) =
+            render_pages(&job, sheet, 96.0, &PageRange::All, None, Some(1)).expect("layout");
+        assert!(
+            has_ink(&numbered[0].1, footer.0, footer.1, footer.2, footer.3),
+            "打开页号后底部印上了 n / m"
+        );
+    }
+
+    /// 缩印时页脚的 m 也是文档页数：n 是文档页号，m 就不能是张数，
+    /// 否则会出现「11 / 7」这种页号超过总页数的页脚。
+    #[test]
+    fn a_shared_sheet_stamps_document_page_numbers() {
+        let sheet = SheetGeometry::without_margins(600, 800);
+        let mut job = text_job(20);
+        job.pages_per_sheet = PagesPerSheet::Two;
+        // 两格并排，竖纸的格子是细长形：页面按比例缩进格子后垂直居中，
+        // 页脚跟着缩到格子中部偏下（约 y 558~570）。正文只占格子顶上一截，
+        // 这一段有墨迹就只能是页号。
+        let footer = (100, 548, 100, 40);
+
+        let (total, plain) =
+            render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+        assert_eq!(total, Some(1), "二十行在整页排版下只占一页");
+        assert!(
+            !has_ink(&plain[0].1, footer.0, footer.1, footer.2, footer.3),
+            "没开页号时格子底部是干净的"
+        );
+
+        job.page_number = true;
+        let (_, numbered) = render_pages(&job, sheet, 96.0, &PageRange::All, None, total)
+            .expect("layout");
+        assert!(
+            has_ink(&numbered[0].1, footer.0, footer.1, footer.2, footer.3),
+            "缩印后页号照旧盖在格子底部，n / m 都是文档页数"
+        );
     }
 }

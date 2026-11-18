@@ -17,16 +17,18 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_QUALITY, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
     DT_BOTTOM, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    DT_WORDBREAK, DeleteObject, DrawTextW, FillRect, FrameRect, GetStockObject,
-    GetTextExtentExPointW, GetTextExtentPoint32W, HALFTONE, HBRUSH, HDC, HFONT, HGDIOBJ,
+    DT_WORDBREAK, DeleteObject, DrawTextW, FillRect, GetStockObject,
+    GetTextExtentExPointW, GetTextExtentPoint32W, GetTextMetricsW, HALFTONE, HBRUSH, HDC, HFONT,
+    HGDIOBJ,
     IntersectClipRect, OUT_DEFAULT_PRECIS, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, TRANSPARENT, TextOutW,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, TEXTMETRICW, TRANSPARENT,
+    TextOutW,
 };
 use windows::core::PCWSTR;
 
 use crate::excel::{self, Workbook};
 use crate::print::{Device, ImagePrint, LayoutOutcome, PageRange, PrintFit, PrintSummary};
-use crate::word;
+use crate::word::{self, VAlign};
 
 thread_local! {
     /// Drawing is switched off while pages outside the selected range are laid
@@ -53,8 +55,9 @@ impl Drop for DrawingGuard {
 
 /// Margin around the printed content, in inches.
 pub(crate) const MARGIN_INCHES: f32 = 0.5;
-/// Space between a table cell's border and its text, in points.
-const CELL_PADDING_PT: f32 = 4.0;
+/// Word's default side margin of a table cell, in points (0.19 cm); cells
+/// carry nothing above or below, the line's own leading is the whole gap.
+const CELL_PADDING_PT: f32 = 5.4;
 const BOLD_WEIGHT: i32 = 700;
 const NORMAL_WEIGHT: i32 = 400;
 /// Colour of table borders.
@@ -67,6 +70,7 @@ const LINE_COLOR: u32 = 0x808080;
 /// `stop_after` is the last page a preview needs; the rest of the document is
 /// then left unmeasured, which is what makes a long document open at once.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn print_word(
     device: &mut Device,
     document: &word::WordDocument,
@@ -74,44 +78,46 @@ pub fn print_word(
     height: i32,
     dpi_x: i32,
     dpi_y: i32,
+    hardware: (i32, i32),
     range: &PageRange,
     stop_after: Option<usize>,
     fit_mode: PrintFit,
 ) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
     let hdc = device.hdc();
-    let margin_x = dpi_x as f32 * MARGIN_INCHES;
-    let margin_y = dpi_y as f32 * MARGIN_INCHES;
-    let printable_width = width as f32 - 2.0 * margin_x;
-    let printable_height = height as f32 - 2.0 * margin_y;
-    if printable_width < 72.0 || printable_height < 72.0 {
+    if width < 72 || height < 72 {
         return Err(String::from("打印机没有足够的可打印区域"));
     }
 
     // Points to device pixels, scaled down when the page is wider than paper.
     let natural = dpi_x as f32 / 72.0;
+    // The paper is the printable area plus the unprintable border around it.
+    let paper_width = width as f32 + 2.0 * hardware.0 as f32;
     let fit = match fit_mode {
-        PrintFit::FitToPaper => (printable_width / (document.content_width * natural)).min(1.0),
+        PrintFit::FitToPaper => (paper_width / (document.content_width * natural)).min(1.0),
         PrintFit::ActualSize => 1.0,
     };
     let scale = natural * fit;
-    let column_width = document.content_width * scale;
-    let left = margin_x + (printable_width - column_width) * 0.5;
+    // The text sits at the margins the document was written with, which is
+    // where Word puts it. Drawing starts at the printable area, so the
+    // unprintable border is subtracted first, and a margin narrower than the
+    // border falls back to the printable edge.
+    let left = (document.margin_left * scale - hardware.0 as f32).max(0.0);
+    let top = (document.margin_top * scale - hardware.1 as f32).max(0.0);
+    let bottom = height as f32 - (document.margin_bottom * scale - hardware.1 as f32).max(0.0);
+    if bottom - top < 72.0 {
+        return Err(String::from("页面边距超出了纸张高度"));
+    }
+    let column_width = (document.content_width * scale).min((width as f32 - left).max(72.0));
 
     let mut fonts = Fonts::new(hdc, dpi_y as f32);
     let mut brushes = Brushes::default();
-    let mut pages = Pages::new(
-        device,
-        margin_y,
-        margin_y + printable_height,
-        range.clone(),
-        stop_after,
-    );
+    let mut pages = Pages::new(device, top, bottom, range.clone(), stop_after);
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
     }
 
-    let mut y = margin_y;
+    let mut y = top;
     for block in &document.blocks {
         let more = match block {
             word::Block::Paragraph(paragraph) => {
@@ -134,7 +140,10 @@ pub fn print_word(
                 table,
                 left,
                 &mut y,
-                column_width,
+                // A table keeps its own width even when it runs past the text
+                // column into the margin, so it may use the room up to the
+                // printable edge.
+                width as f32 - left,
                 scale,
             )?,
         };
@@ -593,6 +602,17 @@ fn select(hdc: HDC, font: HFONT) {
 
 // ------------------------------------------------------------------ measuring
 
+/// Ascent and descent of the font selected into `hdc`, which place a run on
+/// the shared baseline of its line.
+fn font_metrics(hdc: HDC) -> (f32, f32) {
+    let mut metrics = TEXTMETRICW::default();
+    if unsafe { GetTextMetricsW(hdc, &mut metrics) }.as_bool() {
+        (metrics.tmAscent as f32, metrics.tmDescent as f32)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 fn text_width(hdc: HDC, text: &[u16]) -> f32 {
     let mut size = SIZE::default();
     let _ = unsafe { GetTextExtentPoint32W(hdc, text, &mut size) };
@@ -649,17 +669,38 @@ enum Item {
         line: Line,
         indent: f32,
     },
+}
+
+/// One laid-out line: text runs and inline pictures sharing a baseline. The
+/// ascent is the distance from the line top down to the baseline — the tallest
+/// text ascent or picture on the line — and the descent hangs below it.
+#[derive(Default)]
+struct Line {
+    parts: Vec<LinePart>,
+    width: f32,
+    ascent: f32,
+    descent: f32,
+}
+
+enum LinePart {
+    Text {
+        text: Vec<u16>,
+        font: HFONT,
+        color: COLORREF,
+        /// Colour painted behind the run, from `w:highlight`.
+        highlight: Option<u32>,
+        /// Distance from the top of the run's character cell down to the
+        /// baseline, so every run sits on the shared baseline.
+        ascent: f32,
+        /// Distance from the baseline down to the bottom of the cell, which a
+        /// highlighted run paints its background over.
+        descent: f32,
+    },
     Image {
         pixels: Arc<RgbaImage>,
         width: f32,
         height: f32,
     },
-}
-
-#[derive(Default)]
-struct Line {
-    segments: Vec<(Vec<u16>, HFONT, COLORREF)>,
-    width: f32,
 }
 
 struct ParagraphLayout {
@@ -683,8 +724,13 @@ impl ParagraphLayout {
                 .items
                 .iter()
                 .map(|item| match item {
-                    Item::Line { .. } => self.line_height,
-                    Item::Image { height, .. } => *height,
+                    Item::Line { line, .. } => {
+                        if line.ascent + line.descent > 0.0 {
+                            line.ascent + line.descent
+                        } else {
+                            self.line_height
+                        }
+                    }
                 })
                 .sum::<f32>()
     }
@@ -714,6 +760,7 @@ fn layout_paragraph(
         content_width: width.max(24.0),
         first_line: true,
         first_indent,
+        line_height,
     };
 
     let base_family = paragraph.font.clone().unwrap_or_default();
@@ -727,16 +774,55 @@ fn layout_paragraph(
             false,
             paragraph.size,
             run_color(None, paragraph),
+            None,
         );
     }
 
-    for run in &paragraph.runs {
+    // Word hangs the spaces at the end of a paragraph instead of wrapping on
+    // them. Without the hang, a padded paragraph paints its highlight on a
+    // line of its own, so the padding is dropped here just like the reader
+    // drops it.
+    let mut hang = paragraph
+        .runs
+        .iter()
+        .rev()
+        .take_while(|run| run.image.is_none())
+        .flat_map(|run| run.text.chars().rev())
+        .take_while(|ch| matches!(ch, ' ' | '\u{3000}'))
+        .count();
+    let mut cuts = vec![0usize; paragraph.runs.len()];
+    for (index, run) in paragraph.runs.iter().enumerate().rev() {
+        if run.image.is_some() || hang == 0 {
+            break;
+        }
+        let cut = run
+            .text
+            .chars()
+            .rev()
+            .take_while(|ch| matches!(ch, ' ' | '\u{3000}'))
+            .count()
+            .min(hang);
+        cuts[index] = cut;
+        hang -= cut;
+    }
+
+    for (index, run) in paragraph.runs.iter().enumerate() {
         if let Some(image) = &run.image {
             flow.push_image(image, scale);
             continue;
         }
+        let mut text = run.text.as_str();
+        if cuts[index] > 0 {
+            let bytes: usize = text
+                .chars()
+                .rev()
+                .take(cuts[index])
+                .map(char::len_utf8)
+                .sum();
+            text = &text[..text.len() - bytes];
+        }
         flow.push_text(
-            &run.text,
+            text,
             run.font.as_deref().unwrap_or(&base_family),
             run.bold || paragraph.bold,
             run.italic || paragraph.italic,
@@ -744,6 +830,7 @@ fn layout_paragraph(
             run.strike,
             run.size.unwrap_or(paragraph.size),
             run_color(run.color, paragraph),
+            run.highlight,
         );
     }
     flow.finish();
@@ -787,6 +874,8 @@ struct Flow<'a> {
     content_width: f32,
     first_line: bool,
     first_indent: f32,
+    /// The paragraph's text line height; a line without pictures is this tall.
+    line_height: f32,
 }
 
 impl Flow<'_> {
@@ -795,8 +884,13 @@ impl Flow<'_> {
     }
 
     fn flush(&mut self) {
-        if self.line.segments.is_empty() {
+        if self.line.parts.is_empty() {
             return;
+        }
+        // A text-only line keeps the paragraph's line height; a picture raises
+        // the ascent and the descent hangs below the shared baseline.
+        if self.line.ascent + self.line.descent < self.line_height {
+            self.line.descent = self.line_height - self.line.ascent;
         }
         let indent = if self.first_line {
             self.first_indent
@@ -824,6 +918,7 @@ impl Flow<'_> {
         strike: bool,
         size_pt: f32,
         color: COLORREF,
+        highlight: Option<u32>,
     ) {
         if text.is_empty() {
             return;
@@ -832,6 +927,7 @@ impl Flow<'_> {
             .fonts
             .get(family, bold, italic, underline, strike, size_pt);
         select(self.hdc, font);
+        let (run_ascent, run_descent) = font_metrics(self.hdc);
 
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
@@ -843,7 +939,7 @@ impl Flow<'_> {
                 let remaining = self.limit - self.line.width;
                 let mut fit = fit_prefix(self.hdc, &utf16[start..], remaining);
                 if fit == 0 {
-                    if self.line.segments.is_empty() {
+                    if self.line.parts.is_empty() {
                         // A single glyph wider than the line still gets placed.
                         fit = 1;
                     } else {
@@ -854,7 +950,16 @@ impl Flow<'_> {
 
                 let chunk = &utf16[start..start + fit];
                 let width = text_width(self.hdc, chunk);
-                self.line.segments.push((chunk.to_vec(), font, color));
+                self.line.parts.push(LinePart::Text {
+                    text: chunk.to_vec(),
+                    font,
+                    color,
+                    highlight,
+                    ascent: run_ascent,
+                    descent: run_descent,
+                });
+                self.line.ascent = self.line.ascent.max(run_ascent);
+                self.line.descent = self.line.descent.max(run_descent);
                 self.line.width += width;
                 start += fit;
                 if start < utf16.len() {
@@ -865,11 +970,6 @@ impl Flow<'_> {
     }
 
     fn push_image(&mut self, image: &word::InlineImage, scale: f32) {
-        self.flush();
-        if self.first_line {
-            self.first_line = false;
-            self.limit = self.rest_width;
-        }
         let mut width = (image.width * scale).max(1.0);
         let mut height = (image.height * scale).max(1.0);
         // A picture wider than the column used to run past the right margin and
@@ -880,11 +980,22 @@ impl Flow<'_> {
             height *= self.content_width / width;
             width = self.content_width;
         }
-        self.items.push(Item::Image {
+        // Word draws an inline picture on the text line; one that does not fit
+        // any more starts the next line, like a wrapped word would.
+        if !self.line.parts.is_empty() && self.line.width + width > self.limit {
+            self.flush();
+        }
+        self.line.parts.push(LinePart::Image {
             pixels: image.pixels.clone(),
             width,
             height,
         });
+        self.line.width += width;
+        // The picture stands on the baseline, so it raises the line's ascent.
+        self.line.ascent = self.line.ascent.max(height);
+        if self.line.descent == 0.0 {
+            self.line.descent = self.line_height * 0.3;
+        }
     }
 }
 
@@ -906,31 +1017,83 @@ fn draw_layout(
         let content_width = (width - layout.indent).max(0.0);
         match item {
             Item::Line { line, indent } => {
-                if let Some(pages) = pages.as_deref_mut()
-                    && !pages.ensure(y, layout.line_height)?
-                {
+                // A line with a tall inline picture is taller than the
+                // paragraph's text line height.
+                let line_height = if line.ascent + line.descent > 0.0 {
+                    line.ascent + line.descent
+                } else {
+                    layout.line_height
+                };
+                if let Some(pages) = pages.as_deref_mut() && !pages.ensure(y, line_height)? {
                     return Ok(false);
                 }
                 let offset = alignment_offset(layout.align, content_width, line.width);
                 let mut cursor = x + layout.indent + indent + offset;
                 let line_top = *y;
+                let baseline = line_top + line.ascent;
                 if let Some(fill) = layout.fill {
-                    fill_rect(hdc, brushes, x, line_top, width, layout.line_height, fill);
+                    fill_rect(hdc, brushes, x, line_top, width, line_height, fill);
                 }
-                for (text, font, color) in &line.segments {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    select(hdc, *font);
-                    if drawing() {
-                        unsafe {
-                            SetTextColor(hdc, *color);
-                            let _ = TextOutW(hdc, cursor.round() as i32, y.round() as i32, text);
+                for part in &line.parts {
+                    match part {
+                        LinePart::Text {
+                            text,
+                            font,
+                            color,
+                            highlight,
+                            ascent,
+                            descent,
+                        } => {
+                            if text.is_empty() {
+                                continue;
+                            }
+                            select(hdc, *font);
+                            let segment_width = text_width(hdc, text);
+                            if let Some(highlight) = highlight {
+                                // Word paints the highlight behind the whole
+                                // character cell, which sits on the baseline.
+                                fill_rect(
+                                    hdc,
+                                    brushes,
+                                    cursor,
+                                    baseline - ascent,
+                                    segment_width,
+                                    ascent + descent,
+                                    *highlight,
+                                );
+                            }
+                            if drawing() {
+                                unsafe {
+                                    SetTextColor(hdc, *color);
+                                    let _ = TextOutW(
+                                        hdc,
+                                        cursor.round() as i32,
+                                        (baseline - ascent).round() as i32,
+                                        text,
+                                    );
+                                }
+                            }
+                            cursor += segment_width;
+                        }
+                        LinePart::Image {
+                            pixels,
+                            width: image_width,
+                            height: image_height,
+                        } => {
+                            // The picture stands on the shared baseline.
+                            draw_rgba(
+                                hdc,
+                                pixels,
+                                cursor,
+                                baseline - image_height,
+                                *image_width,
+                                *image_height,
+                            );
+                            cursor += image_width;
                         }
                     }
-                    cursor += text_width(hdc, text);
                 }
-                *y += layout.line_height;
+                *y += line_height;
                 draw_paragraph_border(
                     hdc,
                     brushes,
@@ -940,29 +1103,8 @@ fn draw_layout(
                     x,
                     line_top,
                     width,
-                    layout.line_height,
+                    line_height,
                 );
-            }
-            Item::Image {
-                pixels,
-                width: image_width,
-                height: image_height,
-            } => {
-                if let Some(pages) = pages.as_deref_mut()
-                    && !pages.ensure(y, *image_height)?
-                {
-                    return Ok(false);
-                }
-                let offset = alignment_offset(layout.align, content_width, *image_width);
-                draw_rgba(
-                    hdc,
-                    pixels,
-                    x + layout.indent + offset,
-                    *y,
-                    *image_width,
-                    *image_height,
-                );
-                *y += *image_height;
             }
         }
     }
@@ -1046,10 +1188,23 @@ fn draw_table(
     if widths.is_empty() {
         return Ok(true);
     }
+    // Word lets a table reach into the margin, so it starts at its own indent
+    // relative to the text column instead of exactly at it.
+    let x = x + table.indent * scale;
+    // Word's default cell margins are 0.19 cm on the sides and nothing above
+    // or below, so the first line sits right under the border.
     let padding = (CELL_PADDING_PT * scale).max(2.0);
+    let padding_y = 0.0_f32;
 
-    for row in &table.rows {
-        // Lay each cell out once so the row can be measured before it is drawn.
+    // Rows each column still has to cover, so the last continuation cell of a
+    // merge knows to close the merged area with a bottom line.
+    let mut remaining: HashMap<usize, usize> = HashMap::new();
+
+    // Two passes: every row is laid out first so merged cells know the total
+    // height of the rows they span, then the rows are drawn.
+    let mut laid_out: Vec<(Vec<CellLayout>, f32)> = Vec::new();
+
+    for (index, row) in table.rows.iter().enumerate() {
         let mut cells = Vec::new();
         let mut column = 0usize;
         for cell in row {
@@ -1058,48 +1213,93 @@ fn draw_table(
             }
             let span = cell.span.max(1).min(widths.len() - column);
             let width: f32 = widths[column..column + span].iter().sum();
+            let start = column;
             let mut paragraphs = Vec::new();
-            let mut sources = Vec::new();
-            collect_paragraphs(&cell.blocks, &mut sources, 0);
-            for paragraph in sources {
-                paragraphs.push(layout_paragraph(
-                    hdc,
-                    fonts,
-                    paragraph,
-                    (width - 2.0 * padding).max(24.0),
-                    scale,
-                ));
+            if !cell.covered {
+                let mut sources = Vec::new();
+                collect_paragraphs(&cell.blocks, &mut sources, 0);
+                for paragraph in sources {
+                    paragraphs.push(layout_paragraph(
+                        hdc,
+                        fonts,
+                        paragraph,
+                        (width - 2.0 * padding).max(24.0),
+                        scale,
+                    ));
+                }
             }
             let height = paragraphs
                 .iter()
                 .map(|paragraph| paragraph.height())
                 .sum::<f32>()
-                + 2.0 * padding;
+                + 2.0 * padding_y;
+            let closing = cell.covered && remaining.get(&start) == Some(&1);
+            if cell.covered {
+                if let Some(count) = remaining.get_mut(&start) {
+                    *count -= 1;
+                    if *count == 0 {
+                        remaining.remove(&start);
+                    }
+                }
+            } else {
+                remaining.remove(&start);
+                if cell.row_span > 1 {
+                    remaining.insert(start, cell.row_span - 1);
+                }
+            }
             cells.push(CellLayout {
                 paragraphs,
                 width,
                 height,
-                fill: cell.fill,
+                fill: if cell.covered { None } else { cell.fill },
+                covered: cell.covered,
+                merged_down: cell.row_span > 1,
+                closing,
+                v_align: cell.v_align,
+                row_span: cell.row_span,
             });
             column += span;
         }
         if cells.is_empty() {
+            laid_out.push((cells, 0.0));
             continue;
         }
 
+        // The stored minimum height keeps short rows as tall as the file
+        // asks; content taller than that still grows the row.
+        let min_height = table.row_heights.get(index).copied().unwrap_or(0.0) * scale;
         let row_height = cells
             .iter()
             .map(|cell| cell.height)
             .fold(0.0_f32, f32::max)
-            .max(2.0 * padding);
-        if !pages.ensure(y, row_height)? {
+            .max(2.0 * padding_y)
+            .max(min_height);
+        laid_out.push((cells, row_height));
+    }
+
+    for (index, (cells, row_height)) in laid_out.iter().enumerate() {
+        if *row_height <= 0.0 {
+            continue;
+        }
+        if !pages.ensure(y, *row_height)? {
             return Ok(false);
         }
 
         let mut cell_x = x;
-        for cell in &cells {
+        for cell in cells {
+            // A merged cell lives in every row it spans, so its box — and the
+            // clip that keeps its contents inside — covers the whole merged
+            // area; clipping to the first row alone would hide its text.
+            let cell_height = if cell.row_span > 1 {
+                laid_out[index..(index + cell.row_span as usize).min(laid_out.len())]
+                    .iter()
+                    .map(|(_, height)| *height)
+                    .sum::<f32>()
+            } else {
+                *row_height
+            };
             if let Some(fill) = cell.fill {
-                fill_rect(hdc, brushes, cell_x, *y, cell.width, row_height, fill);
+                fill_rect(hdc, brushes, cell_x, *y, cell.width, cell_height, fill);
             }
 
             let saved = unsafe { SaveDC(hdc) };
@@ -1109,10 +1309,22 @@ fn draw_table(
                     cell_x.round() as i32,
                     y.round() as i32,
                     (cell_x + cell.width).round() as i32,
-                    (*y + row_height).round() as i32,
+                    (*y + cell_height).round() as i32,
                 )
             };
-            let mut cell_y = *y + padding;
+            let content_height: f32 = cell
+                .paragraphs
+                .iter()
+                .map(|paragraph| paragraph.height())
+                .sum::<f32>();
+            // Centre or bottom-align the contents inside that whole area.
+            let free = (cell_height - 2.0 * padding_y - content_height).max(0.0);
+            let offset = match cell.v_align {
+                VAlign::Center => free / 2.0,
+                VAlign::Bottom => free,
+                VAlign::Top => 0.0,
+            };
+            let mut cell_y = *y + padding_y + offset;
             for paragraph in &cell.paragraphs {
                 // Cells are drawn whole; only the table row itself paginates.
                 let _ = draw_layout(
@@ -1128,15 +1340,57 @@ fn draw_table(
             let _ = unsafe { RestoreDC(hdc, saved) };
 
             if table.borders {
-                frame_rect(hdc, brushes, cell_x, *y, cell.width, row_height, LINE_COLOR);
+                frame_cell(hdc, brushes, cell_x, *y, cell.width, *row_height, cell);
             }
             cell_x += cell.width;
         }
 
-        *y += row_height;
+        *y += *row_height;
     }
 
     Ok(true)
+}
+
+/// Draws the box of one table cell. A continuation cell omits the top line so
+/// it joins the cell above, and the last one closes the merged area with the
+/// bottom line; a cell that merges downwards omits its bottom line.
+#[allow(clippy::too_many_arguments)]
+fn frame_cell(
+    hdc: HDC,
+    brushes: &mut Brushes,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    cell: &CellLayout,
+) {
+    let thickness = 1.0;
+    let top = !cell.covered;
+    let bottom = (!cell.merged_down && !cell.covered) || cell.closing;
+    if top {
+        fill_rect(hdc, brushes, x, y, width, thickness, LINE_COLOR);
+    }
+    fill_rect(hdc, brushes, x, y, thickness, height, LINE_COLOR);
+    fill_rect(
+        hdc,
+        brushes,
+        x + width - thickness,
+        y,
+        thickness,
+        height,
+        LINE_COLOR,
+    );
+    if bottom {
+        fill_rect(
+            hdc,
+            brushes,
+            x,
+            y + height - thickness,
+            width,
+            thickness,
+            LINE_COLOR,
+        );
+    }
 }
 
 struct CellLayout {
@@ -1144,6 +1398,16 @@ struct CellLayout {
     width: f32,
     height: f32,
     fill: Option<u32>,
+    /// The cell continues a merge started above and draws no content.
+    covered: bool,
+    /// The cell merges with the rows below it.
+    merged_down: bool,
+    /// The continuation cell that closes the merged area with a bottom line.
+    closing: bool,
+    /// Rows the cell spans, so its contents can centre across them all.
+    row_span: usize,
+    /// Where the contents sit inside the row height.
+    v_align: word::VAlign,
 }
 
 fn column_widths(table: &word::Table, available: f32, scale: f32) -> Vec<f32> {
@@ -1488,20 +1752,6 @@ fn fill_rect(hdc: HDC, brushes: &mut Brushes, x: f32, y: f32, width: f32, height
     };
     let brush = brushes.get(rgb);
     let _ = unsafe { FillRect(hdc, &rect, brush) };
-}
-
-fn frame_rect(hdc: HDC, brushes: &mut Brushes, x: f32, y: f32, width: f32, height: f32, rgb: u32) {
-    if !drawing() {
-        return;
-    }
-    let rect = RECT {
-        left: x.round() as i32,
-        top: y.round() as i32,
-        right: (x + width).round() as i32,
-        bottom: (y + height).round() as i32,
-    };
-    let brush = brushes.get(rgb);
-    let _ = unsafe { FrameRect(hdc, &rect, brush) };
 }
 
 /// Keeps drawing inside a rectangle for as long as it lives.

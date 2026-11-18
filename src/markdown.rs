@@ -77,6 +77,11 @@ pub fn load(text: &str, base: &Path) -> Result<WordDocument, String> {
     Ok(WordDocument {
         blocks: builder.blocks,
         content_width: CONTENT_WIDTH,
+        page_width: None,
+        margin_left: 0.0,
+        margin_right: 0.0,
+        margin_top: 0.0,
+        margin_bottom: 0.0,
         paragraphs: builder.paragraphs,
     })
 }
@@ -386,6 +391,10 @@ impl Builder<'_> {
 
                 cells.push(TableCell {
                     span: 1,
+                    merge_start: false,
+                    covered: false,
+                    row_span: 1,
+                    v_align: Default::default(),
                     fill: header.then_some(HEADER_FILL),
                     blocks,
                 });
@@ -396,7 +405,9 @@ impl Builder<'_> {
         self.blocks.push(Block::Table(Table {
             rows: table_rows,
             columns: widths,
+            row_heights: Vec::new(),
             borders: true,
+            indent: 0.0,
         }));
     }
 
