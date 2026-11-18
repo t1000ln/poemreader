@@ -12,8 +12,9 @@ use gpui_kit::*;
 use crate::PoemReader;
 
 impl PoemReader {
-    /// 注册 Ctrl+C（复制所选文字）、Ctrl+P（打印）、Ctrl+Shift+P（打印预览），
-    /// 以及预览窗口里的 Esc（关闭）、Ctrl+P（打印）和缩放。
+    /// 注册 Ctrl+O（加载文件）、Ctrl+C（复制所选文字）、Ctrl+P（打印）、
+    /// Ctrl+Shift+P（打印预览），以及预览窗口里的 Esc（关闭）、Ctrl+P（打印）
+    /// 和缩放。
     ///
     /// 返回的订阅必须由视图持有，一旦被丢弃，拦截会立刻失效。
     pub(crate) fn bind_shortcuts(cx: &mut Context<Self>) -> Subscription {
@@ -63,6 +64,11 @@ impl PoemReader {
             }
 
             match keystroke.key.as_str() {
+                // 打开文件：和大多数编辑器一样，Ctrl+O 直接弹文件对话框。
+                "o" => {
+                    view.update(cx, |this, cx| this.load_file(window, cx)).ok();
+                    cx.stop_propagation();
+                }
                 "c" => {
                     if view
                         .update(cx, |this, cx| this.copy_selection(cx))

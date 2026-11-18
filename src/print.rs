@@ -285,16 +285,18 @@ pub enum PagesPerSheet {
     Four,
     Six,
     Eight,
+    Nine,
 }
 
 impl PagesPerSheet {
     /// The choices the print controls offer, in order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         PagesPerSheet::One,
         PagesPerSheet::Two,
         PagesPerSheet::Four,
         PagesPerSheet::Six,
         PagesPerSheet::Eight,
+        PagesPerSheet::Nine,
     ];
 
     /// How many pages one sheet holds.
@@ -305,6 +307,7 @@ impl PagesPerSheet {
             PagesPerSheet::Four => 4,
             PagesPerSheet::Six => 6,
             PagesPerSheet::Eight => 8,
+            PagesPerSheet::Nine => 9,
         }
     }
 
@@ -316,6 +319,7 @@ impl PagesPerSheet {
             PagesPerSheet::Four => "4 合 1",
             PagesPerSheet::Six => "6 合 1",
             PagesPerSheet::Eight => "8 合 1",
+            PagesPerSheet::Nine => "9 合 1",
         }
     }
 
@@ -334,6 +338,8 @@ impl PagesPerSheet {
             (PagesPerSheet::Six, true) => (2, 3),
             (PagesPerSheet::Eight, false) => (4, 2),
             (PagesPerSheet::Eight, true) => (2, 4),
+            // 九页只能排成三行三列，横竖都留出等宽的边。
+            (PagesPerSheet::Nine, _) => (3, 3),
         }
     }
 }
@@ -630,9 +636,10 @@ mod surface {
         grid: (usize, usize),
         /// Printable area of the sheet that receives them.
         printable: (i32, i32),
-        /// Slot the next finished page goes into.
-        slot: usize,
-        /// Sheets finished so far, which is the index of the one being filled.
+        /// Index of the sheet being filled, counted from the start of the
+        /// document. It is derived from the page being painted, not from how
+        /// many sheets this pass has filled: a preview asks for the sheets in
+        /// front of the reader, and those are numbered for the document.
         page: usize,
         /// A sheet has been started on the target and not yet finished.
         open: bool,
@@ -776,7 +783,6 @@ mod surface {
                 source,
                 grid,
                 printable,
-                slot: 0,
                 page: 0,
                 open: false,
             });
@@ -825,7 +831,7 @@ mod surface {
                 self.draw_footer(index)?;
             }
             if self.shrink.is_some() {
-                return self.compose();
+                return self.compose(index);
             }
             self.finish_sheet(index)
         }
@@ -915,8 +921,6 @@ mod surface {
             self.finish_sheet(index)?;
             if let Some(shrink) = self.shrink.as_mut() {
                 shrink.open = false;
-                shrink.slot = 0;
-                shrink.page += 1;
             }
             Ok(())
         }
@@ -965,27 +969,39 @@ mod surface {
 
         /// Draw the page that was just finished into the sheet being filled,
         /// and hand that sheet over once the grid is full.
-        fn compose(&mut self) -> Result<(), String> {
+        ///
+        /// `page_index` is the document page that was painted. The sheet it
+        /// belongs to, and its slot in the grid, both come from that number, so
+        /// a pass that only paints the pages of the sheets a preview asked for
+        /// still numbers every sheet the way the document does.
+        fn compose(&mut self, page_index: usize) -> Result<(), String> {
             let Some(mut shrink) = self.shrink.take() else {
                 return Ok(());
             };
             let result = (|| -> Result<(), String> {
-                if !shrink.open {
+                let per_sheet = (shrink.grid.0.max(1) * shrink.grid.1.max(1)).max(1);
+                let sheet_index = page_index / per_sheet;
+                let slot = page_index % per_sheet;
+
+                if !shrink.open || slot == 0 {
+                    if shrink.open {
+                        // The sheet before this one was not filled: close it
+                        // rather than draw one page of another sheet into it.
+                        let previous = shrink.page;
+                        self.finish_sheet(previous)?;
+                    }
                     self.begin_sheet()?;
                     shrink.open = true;
+                    shrink.page = sheet_index;
                 }
 
                 let page = (shrink.source.width as i32, shrink.source.height as i32);
-                let slot = super::slot_rect(shrink.printable, shrink.grid, page, shrink.slot);
+                let rect = super::slot_rect(shrink.printable, shrink.grid, page, slot);
                 let target = self.sheet.as_ref().map(|sheet| sheet.dc).unwrap_or(self.hdc);
-                draw_shrunk(target, &shrink.source, slot);
+                draw_shrunk(target, &shrink.source, rect);
 
-                shrink.slot += 1;
-                if shrink.slot >= shrink.grid.0.max(1) * shrink.grid.1.max(1) {
-                    let index = shrink.page;
-                    self.finish_sheet(index)?;
-                    shrink.slot = 0;
-                    shrink.page += 1;
+                if slot + 1 >= per_sheet {
+                    self.finish_sheet(sheet_index)?;
                     shrink.open = false;
                 }
                 Ok(())
@@ -2161,6 +2177,8 @@ mod tests {
         assert_eq!(PagesPerSheet::Four.grid(false), (2, 2));
         assert_eq!(PagesPerSheet::Six.grid(false), (3, 2));
         assert_eq!(PagesPerSheet::Eight.grid(false), (4, 2));
+        assert_eq!(PagesPerSheet::Nine.grid(false), (3, 3), "nine fill a square grid");
+        assert_eq!(PagesPerSheet::Nine.grid(true), (3, 3), "a wide sheet cannot do better");
     }
 
     #[test]
@@ -2199,6 +2217,56 @@ mod tests {
                 column / width + 1 + 2 * (row / height)
             );
         }
+    }
+
+    /// 九合一把三行三列都填满：九个格子各拿一页，最后一张不满也照印。
+    #[test]
+    fn nine_pages_share_one_sheet() {
+        let sheet = SheetGeometry::without_margins(600, 800);
+        let mut job = text_job(400);
+        let (total, _) = render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+        let pages = total.expect("the whole document was laid out");
+        assert!(pages >= 9, "the sample has to fill nine pages, got {pages}");
+
+        job.pages_per_sheet = PagesPerSheet::Nine;
+        let (total, sheets) =
+            render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+        assert_eq!(total, Some(pages));
+        assert_eq!(sheets.len(), pages.div_ceil(9));
+
+        let (_, first) = &sheets[0];
+        let (width, height) = (first.width() / 3, first.height() / 3);
+        for row in 0..3 {
+            for column in 0..3 {
+                assert!(
+                    has_ink(first, column * width, row * height, width, height),
+                    "第 {} 个格子是空的",
+                    row * 3 + column + 1
+                );
+            }
+        }
+    }
+
+    /// 预览滚动到后面时只画读者面前的那几张。纸号得按文档来数：若从 0 重新
+    /// 数，第二张会顶到第一张的位置上，被请求的那张则一直是空白。
+    #[test]
+    fn a_sheet_later_in_the_document_keeps_its_number() {
+        let sheet = SheetGeometry::without_margins(600, 800);
+        let mut job = text_job(160);
+        job.pages_per_sheet = PagesPerSheet::Two;
+
+        let (_, sheets) =
+            render_pages(&job, sheet, 96.0, &PageRange::Pages(vec![(2, 2)]), Some(1), None)
+                .expect("layout");
+        assert_eq!(sheets.len(), 1, "一张纸只要一张");
+        assert_eq!(
+            sheets[0].0, 1,
+            "第二张纸要带着它在文档里的张号回来，不能被当成第一张"
+        );
+        assert!(
+            has_ink(&sheets[0].1, 0, 0, 300, 400),
+            "这张纸的上半页是画出来的"
+        );
     }
 
     #[test]

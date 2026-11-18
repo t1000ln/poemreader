@@ -83,6 +83,8 @@ pub struct Settings {
     pub pdf_zoom: f32,
     pub background: ReadingBackground,
     pub pointer_mode: PointerMode,
+    /// 纯文本文档左侧要不要显示行号。
+    pub line_numbers: bool,
     pub last_file: Option<PathBuf>,
     /// Reading position keyed by file: a scroll offset for text files, and a
     /// `page + fraction` anchor for PDFs.
@@ -98,6 +100,7 @@ impl Default for Settings {
             pdf_zoom: 1.0,
             background: ReadingBackground::Default,
             pointer_mode: PointerMode::default(),
+            line_numbers: false,
             last_file: None,
             reading_positions: HashMap::new(),
             print_params: PrintParams::default(),

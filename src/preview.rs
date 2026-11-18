@@ -59,6 +59,9 @@ const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 2.5;
 const ZOOM_STEP: f32 = 1.25;
 
+/// 数页数的那趟在自己的线程里跑，界面隔这么久来看一次数完没有。
+const COUNT_POLL: Duration = Duration::from_millis(20);
+
 /// 指针在按钮上停多久才弹提示。
 ///
 /// 工具栏上一排按钮，扫过去就弹一片气泡反而看不清；停得略久一点，提示才像
@@ -227,15 +230,6 @@ fn printer_paper() -> Option<PageInfo> {
 
 /// 一次排版交回的东西：总页数（提前收尾时为 `None`），加上画好的页。
 type FinishedPages = (Option<usize>, Vec<(usize, Arc<RenderImage>)>);
-
-/// 后台在跑的那一趟排版在做什么。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Work {
-    /// 画看得见的那几页。
-    Pages,
-    /// 只为数出总页数，不画。
-    Count,
-}
 
 /// 页面在滚动区域里的位置，单位是逻辑像素。
 struct Layout {
@@ -452,6 +446,9 @@ pub(crate) struct PreviewWindow {
     image_dirty: bool,
     /// 画面挪动之后要重画、但屏幕上还留着旧图的页。
     stale: HashSet<usize>,
+    /// 已经画出来的页没有页脚：画的时候文档总页数还不知道。等页数数完，
+    /// 把它们标成待重画，补上「n / m」。
+    footers_pending: bool,
 }
 
 impl PreviewWindow {
@@ -489,6 +486,7 @@ impl PreviewWindow {
             dragging: None,
             image_dirty: false,
             stale: HashSet::new(),
+            footers_pending: false,
         }
     }
 
@@ -816,6 +814,7 @@ impl PreviewWindow {
         self.rendering.clear();
         self.stale.clear();
         self.image_dirty = false;
+        self.footers_pending = false;
         self.counting = false;
         self.counted = false;
         self.total = None;
@@ -1045,13 +1044,12 @@ impl PreviewWindow {
     ///
     /// `stop_after` is the last page the layout has to reach: everything behind
     /// it stays unmeasured, which is what makes the first page of a long
-    /// document appear at once. Whatever is skipped is counted afterwards by a
-    /// pass that only measures, with [`Work::Count`].
+    /// document appear at once. Whatever is skipped is counted afterwards by
+    /// [`Self::request_count`].
     fn request_pages(
         &mut self,
         pages: Vec<usize>,
         stop_after: Option<usize>,
-        work: Work,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1062,6 +1060,8 @@ impl PreviewWindow {
         // 页脚的 m 是文档页总数：直接打印也是这个语义，缩印时 n 才不会
         // 超过 m。计数这一趟是空的，无所谓。
         let page_total = self.doc_total;
+        // 这一趟刚开始时总页数知不知道：决定交回来的页上有没有页脚。
+        let footers = page_total.is_some();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -1086,12 +1086,68 @@ impl PreviewWindow {
                 .await;
 
             this.update_in(cx, move |this, _window, cx| {
-                this.finish_render(generation, &requested, work, result);
+                this.finish_render(generation, &requested, footers, result);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// 只数页数、不画页：全文分页一趟。
+    ///
+    /// 放在自己的线程里跑。后台执行器一次只跑一趟活，一本几十万字的小说
+    /// 要数上几十秒，占着它的话读者滚到哪一页都得干等。
+    fn request_count(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let job = self.job.clone();
+        let sheet = self.info.sheet;
+        let generation = self.generation;
+        let page_total = self.doc_total;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // 空的范围：只排版，不画页。
+            let range = PageRange::Pages(Vec::new());
+            let counted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                print::render_pages(&job, sheet, PREVIEW_DPI, &range, None, page_total)
+            }))
+            .ok()
+            .and_then(|result| result.ok())
+            .and_then(|(total, _)| total);
+            let _ = sender.send(counted);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let counted = loop {
+                match receiver.try_recv() {
+                    Ok(counted) => break counted,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor().timer(COUNT_POLL).await;
+                    }
+                    // 数页数的那趟没了（比如线程崩了）：当作数不出来。
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+            this.update_in(cx, move |this, _window, cx| {
+                this.finish_count(generation, counted);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 收到全文页数。页脚要等它：数完才知道「共几页」。
+    fn finish_count(&mut self, generation: u64, counted: Option<usize>) {
+        if self.generation != generation {
+            return;
+        }
+        self.counting = false;
+        self.counted = true;
+        if let Some(total) = counted {
+            // render_pages 返回文档页数；预览按张排版，缩印时换算成张数。
+            self.doc_total = Some(total);
+            self.total = Some(total.div_ceil(self.job.pages_per_sheet.count()));
+        }
     }
 
     /// 收到默认打印机的纸张尺寸。预览在此之前只显示占位页。
@@ -1110,7 +1166,7 @@ impl PreviewWindow {
         &mut self,
         generation: u64,
         requested: &[usize],
-        work: Work,
+        footers: bool,
         result: Option<FinishedPages>,
     ) {
         if self.generation != generation {
@@ -1118,10 +1174,6 @@ impl PreviewWindow {
         }
         let focus = requested.first().copied().unwrap_or(0);
 
-        if work == Work::Count {
-            self.counting = false;
-            self.counted = true;
-        }
         for page in requested {
             self.rendering.remove(page);
             self.stale.remove(page);
@@ -1129,6 +1181,9 @@ impl PreviewWindow {
 
         match result {
             Some((total, pages)) => {
+                // 这一趟刚开始时总页数还不知道，页脚就印不上。数完再把这几
+                // 页重画一遍补上；不能为了页脚让第一页干等着。
+                let footerless = self.job.page_number && !footers && !pages.is_empty();
                 if let Some(total) = total {
                     // render_pages 返回文档页数；预览按张排版，缩印时换算成张数。
                     self.doc_total = Some(total);
@@ -1138,6 +1193,9 @@ impl PreviewWindow {
                 }
                 for (index, image) in pages {
                     self.store(index, image, focus);
+                }
+                if footerless {
+                    self.footers_pending = true;
                 }
             }
             None => self.failed = true,
@@ -1210,6 +1268,14 @@ impl PreviewWindow {
             self.stale.extend(visible.clone());
         }
 
+        // 总页数数出来了：之前画好的页上没有页脚。把它们标成待重画，新图画
+        // 好再换上去，中间不会闪回占位文字。
+        if self.footers_pending && self.total.is_some() && ready && !failed {
+            self.footers_pending = false;
+            let painted = self.cache.keys().copied().collect::<Vec<_>>();
+            self.stale.extend(painted);
+        }
+
         // Ask for the pages on screen that are not painted yet. One layout pass
         // draws them all, and it may stop right after the last one.
         let missing = visible
@@ -1223,20 +1289,19 @@ impl PreviewWindow {
         let count_rest =
             ready && !failed && self.total.is_none() && !self.counting && !self.counted;
 
-        // 页号开着就先把全文数完：页脚上的「共几页」不能用猜测值。
-        let count_first = ready && !failed && self.job.page_number && self.total.is_none();
-        if ready && !failed && !missing.is_empty() && !count_first {
+        // 先画看得见的页，页数另外数：一本几十万字的小说要数上很久，把第一
+        // 页押在它后面就是一片空白。页号开着时，数完再把这批页重画一遍补上
+        // 页脚（见 `footers_pending`）。
+        if ready && !failed && !missing.is_empty() {
             let stop_after = missing.last().copied();
             for index in &missing {
                 self.rendering.insert(*index);
             }
-            self.request_pages(missing, stop_after, Work::Pages, window, cx);
-        } else if count_first && !self.counting {
+            self.request_pages(missing, stop_after, window, cx);
+        }
+        if count_rest {
             self.counting = true;
-            self.request_pages(Vec::new(), None, Work::Count, window, cx);
-        } else if count_rest {
-            self.counting = true;
-            self.request_pages(Vec::new(), None, Work::Count, window, cx);
+            self.request_count(window, cx);
         }
 
         // Only the pages in view are built: a long document would otherwise

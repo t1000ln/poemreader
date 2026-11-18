@@ -24,7 +24,7 @@ pub const LINE_GAP: f32 = 4.;
 /// Blank source lines are shorter than text rows, which reads as a paragraph break.
 const BLANK_LINE_RATIO: f32 = 0.6;
 /// Never wrap narrower than this, so a very narrow window still lays out sensibly.
-const MIN_WRAP_WIDTH: f32 = 120.;
+pub const MIN_WRAP_WIDTH: f32 = 120.;
 /// Files smaller than this are wrapped on one thread; splitting a small file
 /// across threads costs more in thread setup than the wrapping itself saves.
 const PARALLEL_WRAP_THRESHOLD: usize = 256 * 1024;
@@ -35,14 +35,19 @@ struct Row {
     end: usize,
     /// The row continues a wrapped source line instead of starting one.
     continuation: bool,
+    /// 1-based number of the source line this row belongs to. Every row of a
+    /// wrapped line carries the same number, so the gutter can label a line
+    /// once, next to its first row.
+    line: usize,
 }
 
 /// One worker's share of the wrapping work. Offsets are relative to the
 /// chunk's base; merging translates them back to absolute source offsets and
-/// accumulates the heights.
+/// accumulates the heights. The line number of a row is likewise relative to
+/// the chunk and offset by the lines of the chunks before it.
 struct ChunkRows {
     base: usize,
-    rows: Vec<(usize, usize, bool)>,
+    rows: Vec<(usize, usize, bool, usize)>,
     line_count: usize,
 }
 
@@ -106,25 +111,7 @@ impl TextView {
             })
         };
 
-        let mut rows = Vec::new();
-        let mut tops = Vec::with_capacity(256);
-        tops.push(0.);
-        let mut line_count = 0;
-        for chunk in finished {
-            line_count += chunk.line_count;
-            for (start, end, continuation) in chunk.rows {
-                push_row(
-                    &mut rows,
-                    &mut tops,
-                    chunk.base,
-                    start,
-                    end,
-                    continuation,
-                    line_height,
-                    blank_height,
-                );
-            }
-        }
+        let (rows, tops, line_count) = merge_chunks(finished, line_height, blank_height);
 
         Self {
             source,
@@ -188,6 +175,12 @@ impl TextView {
         self.rows.get(index).is_some_and(|row| !row.continuation)
     }
 
+    /// 1-based number of the source line a row belongs to, or 0 when there is
+    /// no such row.
+    pub fn row_line(&self, index: usize) -> usize {
+        self.rows.get(index).map_or(0, |row| row.line)
+    }
+
     pub fn row_top(&self, index: usize) -> f32 {
         self.tops.get(index).copied().unwrap_or(0.)
     }
@@ -229,6 +222,42 @@ impl TextView {
             .map(|row| row.start)
             .unwrap_or(0)
     }
+}
+
+/// Merge the wrapped chunks in reading order, translating the offsets and line
+/// numbers that are relative to a chunk back to the whole document.
+///
+/// Returns the rows, the row tops and the number of lines in the source. The
+/// last entry of the tops is the height of the whole block.
+fn merge_chunks(
+    chunks: Vec<ChunkRows>,
+    line_height: f32,
+    blank_height: f32,
+) -> (Vec<Row>, Vec<f32>, usize) {
+    let mut rows = Vec::new();
+    let mut tops = Vec::with_capacity(256);
+    tops.push(0.);
+    let mut line_count = 0;
+    for chunk in chunks {
+        // Rows carry a line number relative to their chunk, so the lines of the
+        // chunks already merged are added on top.
+        let first_line = line_count + 1;
+        line_count += chunk.line_count;
+        for (start, end, continuation, line) in chunk.rows {
+            push_row(
+                &mut rows,
+                &mut tops,
+                chunk.base,
+                start,
+                end,
+                continuation,
+                first_line + line,
+                line_height,
+                blank_height,
+            );
+        }
+    }
+    (rows, tops, line_count)
 }
 
 /// How many workers to use for a file of `size` bytes. Small files stay on one
@@ -299,24 +328,31 @@ fn wrap_chunk(
         } else {
             line_break
         };
+        // 0-based within the chunk; the merge adds the lines of earlier chunks.
+        let line = line_count;
         line_count += 1;
 
-        let line = &slice[offset..line_end];
+        let line_text = &slice[offset..line_end];
         let mut row_start = 0;
         let mut first = true;
 
-        if !line.is_empty() {
-            for boundary in wrap_line(line, wrap_width, widths) {
+        if !line_text.is_empty() {
+            for boundary in wrap_line(line_text, wrap_width, widths) {
                 if boundary <= row_start {
                     continue;
                 }
-                rows.push((offset + row_start, offset + boundary, !first));
+                rows.push((offset + row_start, offset + boundary, !first, line));
                 row_start = boundary;
                 first = false;
             }
         }
 
-        rows.push((offset + row_start, offset + line.len(), !first));
+        rows.push((
+            offset + row_start,
+            offset + line_text.len(),
+            !first,
+            line,
+        ));
         offset = line_break + 1;
     }
 
@@ -332,6 +368,7 @@ fn blank_height(font_size: Pixels) -> f32 {
 }
 
 /// Record one row against the absolute source text.
+#[allow(clippy::too_many_arguments)]
 fn push_row(
     rows: &mut Vec<Row>,
     tops: &mut Vec<f32>,
@@ -339,6 +376,7 @@ fn push_row(
     start: usize,
     end: usize,
     continuation: bool,
+    line: usize,
     line_height: f32,
     blank_height: f32,
 ) {
@@ -346,6 +384,7 @@ fn push_row(
         start: base + start,
         end: base + end,
         continuation,
+        line,
     });
 
     let height = if start == end {
@@ -355,4 +394,69 @@ fn push_row(
     };
     let top = tops.last().copied().unwrap_or(0.);
     tops.push(top + height + LINE_GAP);
+}
+
+#[cfg(test)]
+mod tests {
+    // 显式导入：`gpui_kit::*` 里也有一张 `test` 属性宏，glob 进来会盖掉内置的
+    // `#[test]`，测试模块编译不过。
+    use super::{CharWidths, merge_chunks, wrap_chunk};
+    use std::collections::HashMap;
+
+    /// Every row of a wrapped line reports that line's number, so the gutter
+    /// labels a line once instead of once per visual row.
+    #[test]
+    fn rows_of_a_wrapped_line_share_its_number() {
+        let mut map = HashMap::new();
+        // 每个字符宽 10px，"一二三四五六七" 在 30px 内折成多行。
+        for c in "一二三四五六七\n八\n".chars() {
+            map.insert(c, 10.0);
+        }
+        let widths = CharWidths::from_map(map);
+        let text = "一二三四五六七\n八\n";
+        let (rows, _, lines) =
+            merge_chunks(vec![wrap_chunk(text, 0, text.len(), &widths, 30.)], 20., 12.);
+
+        assert_eq!(lines, 2);
+        assert!(rows.iter().any(|row| row.continuation));
+        let first_line = rows.iter().filter(|row| row.line == 1).count();
+        assert!(first_line > 1, "长行应当折成多行");
+        assert!(rows.iter().all(|row| row.line == 1 || row.line == 2));
+        assert_eq!(rows.last().expect("至少一行").line, 2);
+    }
+
+    /// Chunks are wrapped on their own, so their line numbers are local and have
+    /// to continue where the previous chunk stopped.
+    #[test]
+    fn line_numbers_continue_across_chunks() {
+        let widths = CharWidths::empty();
+        let text = "一\n二\n三\n四\n";
+        let split = "一\n二\n".len();
+        let (rows, _, lines) = merge_chunks(
+            vec![
+                wrap_chunk(text, 0, split, &widths, 600.),
+                wrap_chunk(text, split, text.len(), &widths, 600.),
+            ],
+            20.,
+            12.,
+        );
+
+        assert_eq!(lines, 4);
+        let numbers: Vec<_> = rows.iter().map(|row| row.line).collect();
+        assert_eq!(numbers, vec![1, 2, 3, 4]);
+    }
+
+    /// Blank lines keep their numbers and the lines after them keep counting,
+    /// which is what an editor shows too.
+    #[test]
+    fn blank_lines_are_numbered_too() {
+        let widths = CharWidths::empty();
+        let text = "甲\n\n乙\n";
+        let (rows, _, lines) =
+            merge_chunks(vec![wrap_chunk(text, 0, text.len(), &widths, 600.)], 20., 12.);
+
+        assert_eq!(lines, 3);
+        let numbers: Vec<_> = rows.iter().map(|row| row.line).collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+    }
 }

@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, TitleBar, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, TitleBar, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
+    kbd::Kbd,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     scroll::{Scrollbar, ScrollbarMode},
@@ -102,6 +103,14 @@ const TEXT_PADDING_Y: f32 = 28.;
 const TEXT_MAX_WIDTH: f32 = 880.;
 /// Height of a text row as a multiple of the font size.
 const LINE_HEIGHT_RATIO: f32 = 1.7;
+/// 行号栏里数字的宽度按字号估算：等宽数字的进制约为 0.62 em，估宽只用于
+/// 给栏留位置，数字靠右对齐，估得略宽比估窄安全。
+const LINE_NUMBER_DIGIT_RATIO: f32 = 0.62;
+/// 行号栏与正文之间空出的距离。
+const LINE_NUMBER_GAP: f32 = 14.;
+/// 行号比正文小一号，颜色也更淡，读正文时不会抢注意力。
+const LINE_NUMBER_RATIO: f32 = 0.82;
+const LINE_NUMBER_OPACITY: f32 = 0.4;
 
 /// How long the window has to stop resizing before the text is wrapped again.
 const REWRAP_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -111,6 +120,9 @@ const SAVE_POSITION_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// The app icon, also embedded in the executable by `build.rs`.
 pub(crate) const APP_ICON: &[u8] = include_bytes!("../assets/icon.svg");
+
+/// 菜单里「打印」的图标：手写的打印机，内嵌进二进制，运行时不需要文件。
+const PRINTER_ICON: &[u8] = include_bytes!("../assets/icons/printer.svg");
 
 fn main() {
     window::run();
@@ -198,18 +210,36 @@ fn build_content(
     font: &Font,
     font_size: Pixels,
     line_height: f32,
-    wrap_width: f32,
+    available_width: f32,
+    line_numbers: bool,
     text_system: &Arc<TextSystem>,
 ) -> DocumentContent {
     match loaded {
-        LoadedContent::Text(text) => DocumentContent::Text(TextView::new(
-            Arc::new(text),
-            font,
-            font_size,
-            line_height,
-            wrap_width,
-            text_system,
-        )),
+        LoadedContent::Text(text) => {
+            // 行号栏要从正文宽度里让出来，而栏宽取决于这份文档有多少行——所以
+            // 折行之前先数一遍换行符，别用上一份文档的行数去估。
+            let gutter = if line_numbers {
+                let breaks = text.bytes().filter(|byte| *byte == b'\n').count();
+                let lines = if text.is_empty() {
+                    0
+                } else if text.ends_with('\n') {
+                    breaks
+                } else {
+                    breaks + 1
+                };
+                line_number_gutter(lines, font_size.as_f32())
+            } else {
+                0.
+            };
+            DocumentContent::Text(TextView::new(
+                Arc::new(text),
+                font,
+                font_size,
+                line_height,
+                available_width - gutter,
+                text_system,
+            ))
+        }
         LoadedContent::Pdf(source) => DocumentContent::Pdf(PdfView::new(source)),
         LoadedContent::Word(document) => DocumentContent::Word(document),
         LoadedContent::Excel(workbook) => DocumentContent::Excel(workbook),
@@ -320,6 +350,8 @@ pub(crate) struct PoemReader {
     background: ReadingBackground,
     /// What the left button does in the reading area.
     pub(crate) pointer_mode: PointerMode,
+    /// 纯文本文档左侧要不要显示行号；菜单里可以切换，选择会记进设置。
+    line_numbers: bool,
     /// Sheet of the open Excel workbook being shown.
     excel_sheet: usize,
     /// Currently selected text, kept after the drag ends so it can be copied.
@@ -365,7 +397,7 @@ impl PoemReader {
         initial: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (font_size, pdf_zoom, background, pointer_mode, print_params) = {
+        let (font_size, pdf_zoom, background, pointer_mode, line_numbers, print_params) = {
             let store = store.borrow();
             let settings = store.settings();
             (
@@ -373,6 +405,7 @@ impl PoemReader {
                 settings.pdf_zoom(),
                 settings.background,
                 settings.pointer_mode,
+                settings.line_numbers,
                 settings.print_params.clone(),
             )
         };
@@ -413,6 +446,7 @@ impl PoemReader {
             image_print,
             background,
             pointer_mode,
+            line_numbers,
             excel_sheet: 0,
             selection: None,
             document_lines: Vec::new(),
@@ -1096,7 +1130,10 @@ impl PoemReader {
         let font = window.text_style().font();
         let font_size = self.font_size;
         let line_height = self.line_height();
-        let wrap_width = self.wrap_width_for(window);
+        // 行号栏的宽度要看新文档有多少行，所以这里给的是还没扣掉栏宽的可用
+        // 宽度，由 `build_content` 自己按新文档算。
+        let available_width = text_wrap_width(window.viewport_size().width.as_f32());
+        let line_numbers = self.line_numbers;
         let text_system = cx.text_system().clone();
 
         // Reading and parsing a big file takes seconds. The old document stays
@@ -1116,7 +1153,8 @@ impl PoemReader {
                         &font,
                         font_size,
                         line_height,
-                        wrap_width,
+                        available_width,
+                        line_numbers,
                         &text_system,
                     );
                     Ok::<_, String>((kind, content))
@@ -1195,9 +1233,34 @@ impl PoemReader {
     }
 
     /// The width the text is wrapped for, taken from the window so a resize is
-    /// noticed before the reading area has been laid out again.
+    /// noticed before the reading area has been laid out again. A visible line
+    /// number column takes its share off the top.
     fn wrap_width_for(&self, window: &Window) -> f32 {
-        text_wrap_width(window.viewport_size().width.as_f32())
+        (text_wrap_width(window.viewport_size().width.as_f32()) - self.line_number_gutter())
+            // 与 `TextView` 的下限一致：窗口窄到连栏宽都放不下时，两边算出来
+            // 的宽度必须相同，否则会每帧都判定「需要重新折行」。
+            .max(text::MIN_WRAP_WIDTH)
+    }
+
+    /// 行号栏的宽度，没显示或不是纯文本时为 0。栏宽按最宽的行号估算，行数越
+    /// 多留得越宽，正文的可用宽度相应少这么多。
+    fn line_number_gutter(&self) -> f32 {
+        match self.document.as_ref().map(|document| &document.content) {
+            Some(DocumentContent::Text(text)) if self.line_numbers => {
+                line_number_gutter(text.line_count(), self.font_size.as_f32())
+            }
+            _ => 0.,
+        }
+    }
+
+    /// 显示或隐藏行号。正文的可用宽度会变，所以要重新折行——和改字号一样，
+    /// 折完停在原来的那一行。
+    fn toggle_line_numbers(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.line_numbers = !self.line_numbers;
+        self.store.borrow_mut().settings_mut().line_numbers = self.line_numbers;
+        self.persist_settings();
+        self.rewrap_text(window, cx);
+        cx.notify();
     }
 
     /// Wrap the text again once the font size or the window width changed.
@@ -1484,6 +1547,28 @@ impl PoemReader {
                 })
         };
 
+        // 行尾带快捷键的菜单项。组件自带的提示只认「绑定了 Action」的项，而
+        // 这里的按键由 shortcuts.rs 在窗口层直接拦截，所以自己排一个键帽。
+        // 图标可以是内置的 IconName，也可以是内嵌 SVG（Icon::data）；不传图标
+        // 时菜单仍按整体左侧图标列留白对齐。
+        let keyed_item = |label: &'static str, icon: Option<Icon>, keys: &'static str| {
+            let item = PopupMenuItem::element(move |_window, _cx| {
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(label)
+                    .child(Kbd::new(
+                        Keystroke::parse(keys).expect("菜单里手写的快捷键"),
+                    ))
+            });
+            match icon {
+                Some(icon) => item.icon(icon),
+                None => item,
+            }
+        };
+
         let file_menu = {
             let view = view.clone();
             Button::new("menu-file")
@@ -1494,25 +1579,30 @@ impl PoemReader {
                     let load = view.clone();
                     let preview = view.clone();
                     let print = view.clone();
-                    let mut menu = menu.min_w(px(220.))
+                    let mut menu = menu.min_w(px(240.))
                         .item(
-                            PopupMenuItem::new("加载文件…")
-                                .icon(IconName::FolderOpen)
+                            keyed_item("加载文件…", Some(IconName::FolderOpen.into()), "ctrl-o")
                                 .on_click(move |_, window, cx| {
                                     load.update(cx, |this, cx| this.load_file(window, cx));
                                 }),
                         )
                         .item(
-                            PopupMenuItem::new("打印预览…")
-                                .icon(IconName::Eye)
+                            keyed_item("打印预览…", Some(IconName::Eye.into()), "ctrl-shift-p")
                                 .on_click(move |_, window, cx| {
                                     preview
                                         .update(cx, |this, cx| this.open_preview(window, cx));
                                 }),
                         )
-                        .item(PopupMenuItem::new("打印…").on_click(move |_, window, cx| {
-                            print.update(cx, |this, cx| this.print_document(window, cx));
-                        }))
+                        .item(
+                            keyed_item(
+                                "打印…",
+                                Some(Icon::default().data(PRINTER_ICON)),
+                                "ctrl-p",
+                            )
+                            .on_click(move |_, window, cx| {
+                                print.update(cx, |this, cx| this.print_document(window, cx));
+                            }),
+                        )
                         .separator()
                         // 方向也在这里选：预览里同样可以切换，两处说的是同一件事。
                         .item(
@@ -1566,6 +1656,11 @@ impl PoemReader {
                             PagesPerSheet::Eight,
                             self_pages,
                             view.clone(),
+                        ))
+                        .item(pages_item(
+                            PagesPerSheet::Nine,
+                            self_pages,
+                            view.clone(),
                         ));
 
                     // 图片没有版式，能缩放的只有画面本身，所以这一组只在看图
@@ -1614,6 +1709,26 @@ impl PoemReader {
                     )
                 })
         };
+
+        // 行号只有纯文本才有，所以「视图」菜单只在看 txt 时出现。
+        let view_menu = self.is_text().then(|| {
+            let view = view.clone();
+            let shown = self.line_numbers;
+            Button::new("menu-view")
+                .custom(menu_variant)
+                .compact()
+                .label("视图")
+                .dropdown_menu(move |menu, _window, _cx| {
+                    let view = view.clone();
+                    menu.min_w(px(180.)).item(
+                        PopupMenuItem::new("显示行号").checked(shown).on_click(
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| this.toggle_line_numbers(window, cx));
+                            },
+                        ),
+                    )
+                })
+        });
 
         // Text has a font size; the paged and tabular formats are zoomed instead.
         let size_menu = {
@@ -1706,6 +1821,7 @@ impl PoemReader {
                             .text_color(foreground),
                     )
                     .child(file_menu)
+                    .children(view_menu)
                     .child(size_menu)
                     .child(background_menu)
                     // The title bar owns window dragging, which consumes the mouse-up
@@ -1760,6 +1876,7 @@ impl PoemReader {
         let selection = self.selection;
         let offset = self.scroll_offset();
         let viewport = self.scroll_viewport(window);
+        let line_numbers = self.line_numbers;
 
         let Some(document) = self.document.as_mut() else {
             return empty_body(foreground);
@@ -1774,7 +1891,12 @@ impl PoemReader {
         let row_count = text.row_count();
         let first = text.row_at(offset - overscan);
         let last = text.row_at(offset + viewport.height + overscan);
-        let column_width = text.wrap_width() + 2.0 * TEXT_PADDING_X;
+        let gutter = if line_numbers {
+            line_number_gutter(text.line_count(), font_size.as_f32())
+        } else {
+            0.
+        };
+        let column_width = text.wrap_width() + 2.0 * TEXT_PADDING_X + gutter;
         let content_height = text.content_height() + 2.0 * TEXT_PADDING_Y;
 
         self.row_layouts.clear();
@@ -1783,12 +1905,40 @@ impl PoemReader {
             let slot = Rc::new(RefCell::new(None));
             self.row_layouts.insert(index, slot.clone());
 
+            // 行号只标在源文本行的第一行上：折行出来的续行不再重复编号，和编辑器
+            // 里的样子一致。空行也是源文本的一行，照样编号。
+            if gutter > 0. && text.row_starts_line(index) {
+                let height = text.row_height(index);
+                // 空行比正文行矮一截，数字也跟着小一号再居中，免得连续空行的号
+                // 挤到一起。
+                let number_size = if height < line_height {
+                    height * 0.9
+                } else {
+                    font_size.as_f32() * LINE_NUMBER_RATIO
+                };
+                rows.push(
+                    div()
+                        .absolute()
+                        .top(px(TEXT_PADDING_Y + text.row_top(index)))
+                        .left(px(TEXT_PADDING_X))
+                        .w(px(gutter - LINE_NUMBER_GAP))
+                        .h(px(height))
+                        .text_right()
+                        .text_size(px(number_size))
+                        .line_height(px(height.max(1.)))
+                        .text_color(foreground.opacity(LINE_NUMBER_OPACITY))
+                        .whitespace_nowrap()
+                        .child(SharedString::from(text.row_line(index).to_string()))
+                        .into_any_element(),
+                );
+            }
+
             let line = text.row_text(index);
             let mut row = div()
                 .id(("poem-row", index))
                 .absolute()
                 .top(px(TEXT_PADDING_Y + text.row_top(index)))
-                .left(px(TEXT_PADDING_X))
+                .left(px(TEXT_PADDING_X + gutter))
                 .right(px(TEXT_PADDING_X))
                 .h(px(text.row_height(index)))
                 .text_size(font_size)
@@ -2387,6 +2537,12 @@ fn image_layout(picture: &Picture, viewport: Size<f32>, zoom: f32) -> (f32, f32)
 /// pixels. The block is centred and no wider than [`TEXT_MAX_WIDTH`].
 fn text_wrap_width(viewport_width: f32) -> f32 {
     (viewport_width.min(TEXT_MAX_WIDTH) - 2.0 * TEXT_PADDING_X).max(160.)
+}
+
+/// 行号栏的宽度：按最宽的那个行号留位置，再多留一段与正文的间距。
+fn line_number_gutter(line_count: usize, font_size: f32) -> f32 {
+    let digits = line_count.max(1).to_string().len() as f32;
+    (digits * font_size * LINE_NUMBER_DIGIT_RATIO + LINE_NUMBER_GAP).round()
 }
 
 /// Shown when no document is open.
