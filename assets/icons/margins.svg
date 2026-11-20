@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 纸：外框是整个可打印区域，内框是正文留白之后真正落墨的那一块。 -->
+  <rect x="3" y="3" width="18" height="18" rx="2" />
+  <rect x="6.5" y="6.5" width="11" height="11" rx="1" stroke-width="1.2" opacity="0.85" />
+</svg>
