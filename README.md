@@ -192,6 +192,13 @@ dist/
 发布版 exe 已内嵌图标与版本信息（ProductName / FileVersion 等）。
 目标机器需要已安装 Microsoft Visual C++ 运行库（绝大多数 Windows 10/11 自带）。
 
+## 下载
+
+预编译的发布包随仓库一起提供，不需要自己编译：
+
+- `releases/PoemReader-0.1.0-win64.zip`
+- 校验和见 `releases/SHA256SUMS.txt`
+
 ## 安装
 
 发布包里带一个免管理员的安装脚本。解压后**双击 `install.cmd`** 即可，它会：

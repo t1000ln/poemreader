@@ -1,0 +1,5 @@
+# 发布包是二进制，不做换行转换
+*.zip binary
+
+# 校验和文件保持 LF，sha256sum -c 才能直接校验
+releases/SHA256SUMS.txt text eol=lf

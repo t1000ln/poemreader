@@ -1,0 +1,1 @@
+c62862819a6e10019fb8deb0994a50e33d7ee6860b1bbc1eb9ec4cb7f60b17d8  PoemReader-0.1.0-win64.zip
