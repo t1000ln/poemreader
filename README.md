@@ -1,5 +1,7 @@
 # PoemReader
 
+[![Win64](https://img.shields.io/badge/Win64-0078D4?logo=windows&logoColor=white)](https://github.com/t1000ln/poemreader/releases/latest)
+
 使用 [GPUI Kit](https://gpui-kit.com)（GPUI + GPUI Component）构建的极简阅读器和打印工具，方便简单查看和快速打印，没有任何编辑修改功能！
 当前版本仅支持`Win64`环境。
 
