@@ -1,0 +1,85 @@
+name: release
+
+# 把仓库里 releases/ 下的发布包挂到 GitHub Release 上。
+#
+# 为什么由 CI 来上传：这台机器到 uploads.github.com 的上行只有几十 KB/s，
+# 直传 10 MB 的包会在 GitHub 的 30 秒无进展超时上稳定失败（HTTP 408）。
+# 包本身随 git 提交进仓库，runner 在 GitHub 内网取到它再传给 Release API，
+# 不依赖本地上行带宽。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag，例如 v0.1.0'
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析 tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 列出待上传的资产
+        id: assets
+        run: |
+          version="${{ steps.tag.outputs.version }}"
+          zip="releases/PoemReader-${version}-win64.zip"
+          if [ ! -f "$zip" ]; then
+            echo "找不到 $zip" >&2
+            exit 1
+          fi
+          list="$zip"
+          if [ -f releases/SHA256SUMS.txt ]; then
+            list="$list releases/SHA256SUMS.txt"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+      - name: 校验压缩包与校验和一致
+        run: |
+          cd releases
+          sha256sum -c SHA256SUMS.txt
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          assets="${{ steps.assets.outputs.list }}"
+          notes="releases/${tag}.md"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，补传资产"
+            gh release upload "$tag" $assets --clobber
+          else
+            if [ -f "$notes" ]; then
+              gh release create "$tag" $assets \
+                --target main \
+                --title "PoemReader ${version}" \
+                --notes-file "$notes"
+            else
+              gh release create "$tag" $assets \
+                --target main \
+                --title "PoemReader ${version}" \
+                --generate-notes
+            fi
+          fi

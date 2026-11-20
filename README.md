@@ -194,10 +194,13 @@ dist/
 
 ## 下载
 
-预编译的发布包随仓库一起提供，不需要自己编译：
+预编译的发布包在 [Releases](../../releases) 页面，不需要自己编译：
 
-- `releases/PoemReader-0.1.0-win64.zip`
-- 校验和见 `releases/SHA256SUMS.txt`
+- `PoemReader-0.1.0-win64.zip`（附带 `SHA256SUMS.txt`）
+
+仓库里的 `releases/` 目录保存着同一份包，`gh` 或仓库源码下载也能拿到。
+发布由 `.github/workflows/release.yml` 完成：打 `v*` tag 或手动触发时，
+它会把 `releases/` 下的包挂到对应 Release 上。
 
 ## 安装
 
