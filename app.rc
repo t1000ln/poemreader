@@ -1,3 +1,6 @@
+// The exe icon, and therefore the process icon shown by Explorer, the taskbar
+// and Alt-Tab: a page (text lines + a photo) coming out of a printer, which is
+// what the program does — read documents and images, and print them.
 1 ICON "assets/icon.ico"
 
 1 VERSIONINFO
@@ -11,7 +14,7 @@ FILETYPE 0x1L
     BLOCK "040904B0"
     {
       VALUE "CompanyName", "PoemReader"
-      VALUE "FileDescription", "PoemReader - a minimal text reader"
+      VALUE "FileDescription", "PoemReader - document and image viewer with printing"
       VALUE "FileVersion", "0.1.0"
       VALUE "InternalName", "poemreader"
       VALUE "OriginalFilename", "PoemReader.exe"

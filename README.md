@@ -132,7 +132,8 @@
     其他平台 `$XDG_CONFIG_HOME/poemreader/settings.json`
   - 每个文件按绝对路径分别记录阅读位置；PDF 记录「第几页 + 页内比例」，
     因此缩放或窗口尺寸变化后仍停在原来的位置
-- 窗口与 exe 使用同一套「打开的书」图标
+- 窗口与 exe 使用同一套图标：一页纸（正文横线 + 一张照片）从打印机出纸口伸出，
+  对应「查看文档与图片、并打印」；16 / 24 像素另有简化画法，保证任务栏上不糊
 
 ## 运行
 
@@ -256,14 +257,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-associations.
 
 ## 图标
 
-- `assets/icon.ico`：多尺寸 ICO，由 `build.rs`（`embed-resource`）嵌入 exe
-- `assets/icon.svg`：标题栏与空状态页使用的单色图标（跟随主题前景色）
+- `assets/icon.ico`：多尺寸 ICO（16/24/32/48/64/128/256），由 `build.rs`
+  （`embed-resource`）嵌入 exe，因此资源管理器、任务栏和任务管理器进程列表
+  显示的都是它
+- `assets/icon.svg`：标题栏与空状态页使用的单色图标（跟随主题前景色），
+  画的是同一件事：一张纸插在打印机里
 - `assets/icons/`：手写的界面小图标，用 `include_bytes!` 内嵌进二进制
   - `printer.svg`：「文件 → 打印…」菜单项前的打印机
   - `page-number.svg`：预览工具栏「页号」按钮上叠放的 1 / 2 / 3
   - `margins.svg`：预览工具栏「边距」按钮上的一页纸与正文框
 - `assets/icon-256.png`：预览图
 - `tools/generate-icon.ps1`：重新生成 `icon.ico` 与预览图
+  - 256 像素是完整画法：纸张上三行正文 + 一张照片，机身有出纸槽与指示灯
+  - 48 / 64 去掉指示灯以外的细节靠缩放，32 及以下单独绘制（12 像素高的粗线、
+    16 / 24 只保留一行正文），避免细线在小尺寸里糊成灰块
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\generate-icon.ps1

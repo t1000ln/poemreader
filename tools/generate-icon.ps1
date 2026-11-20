@@ -1,5 +1,9 @@
-# Generates assets/icon.ico (multi-size, PNG-compressed entries) and a preview PNG.
-# The icon is an open book on a blue rounded-square badge, matching assets/icon.svg.
+# Regenerates assets/icon.ico (multi-size, PNG entries) and assets/icon-256.png.
+#
+# The mark is a sheet of paper — text lines above, a photo below — rising out of
+# a printer: the program reads text documents and images, and prints them. Small
+# sizes (16/24/32) are drawn on their own with heavier strokes instead of being
+# downscaled, because a 256 px drawing loses every hairline on the taskbar.
 param(
     [string]$OutDir = (Join-Path $PSScriptRoot "..\assets")
 )
@@ -11,7 +15,12 @@ $Canvas = 256
 function New-RoundedRectPath {
     param([float]$X, [float]$Y, [float]$W, [float]$H, [float]$R)
     $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $d = $R * 2
+    $r = [Math]::Min($R, [Math]::Min($W, $H) / 2.0)
+    if ($r -le 0.01) {
+        $path.AddRectangle((New-Object System.Drawing.RectangleF($X, $Y, $W, $H)))
+        return $path
+    }
+    $d = $r * 2
     $path.AddArc($X, $Y, $d, $d, 180, 90)
     $path.AddArc($X + $W - $d, $Y, $d, $d, 270, 90)
     $path.AddArc($X + $W - $d, $Y + $H - $d, $d, $d, 0, 90)
@@ -20,132 +29,236 @@ function New-RoundedRectPath {
     return $path
 }
 
-function New-BookBitmap {
-    $bmp = New-Object System.Drawing.Bitmap($Canvas, $Canvas, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+# A page: rounded at the top, square at the bottom, because the bottom edge is
+# tucked into the printer and must cut clean against the front cover.
+function New-PagePath {
+    param([float]$X, [float]$Y, [float]$W, [float]$H, [float]$R)
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = $R * 2
+    $path.AddArc($X, $Y, $d, $d, 180, 90)
+    $path.AddArc($X + $W - $d, $Y, $d, $d, 270, 90)
+    $path.AddLine($X + $W, $Y + $H, $X, $Y + $H)
+    $path.CloseFigure()
+    return $path
+}
+
+function New-VerticalBrush {
+    param([float]$Top, [float]$Bottom, [string]$From, [string]$To)
+    $rect = New-Object System.Drawing.RectangleF(0, $Top, 256, [Math]::Max($Bottom - $Top, 1))
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+        $rect,
+        [System.Drawing.ColorTranslator]::FromHtml($From),
+        [System.Drawing.ColorTranslator]::FromHtml($To),
+        [System.Drawing.Drawing2D.LinearGradientMode]::Vertical
+    )
+    return $brush
+}
+
+function New-DiagonalBrush {
+    param([float]$X, [float]$Y, [float]$W, [float]$H, [string]$From, [string]$To)
+    $rect = New-Object System.Drawing.RectangleF($X, $Y, $W, $H)
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+        $rect,
+        [System.Drawing.ColorTranslator]::FromHtml($From),
+        [System.Drawing.ColorTranslator]::FromHtml($To),
+        115.0
+    )
+    return $brush
+}
+
+function New-AppIcon {
+    param([int]$Size)
+
+    # Below 48 px the drawing is simplified: fewer details, heavier strokes.
+    # Below 32 px only one text line survives, so the sheet still says
+    # "document" instead of turning into grey noise.
+    $small = $Size -lt 48
+    $tiny = $Size -lt 32
+
+    $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
+    # Everything below is laid out on a 256 px grid.
+    $g.ScaleTransform(($Size / 256.0), ($Size / 256.0))
 
-    # Badge background.
-    $bgRect = New-Object System.Drawing.RectangleF(8, 8, 240, 240)
-    $bgPath = New-RoundedRectPath 8 8 240 240 54
-    $bgBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        $bgRect,
-        [System.Drawing.Color]::FromArgb(255, 84, 132, 224),
-        [System.Drawing.Color]::FromArgb(255, 33, 62, 126),
-        115.0
+    # ---- badge -----------------------------------------------------------
+    $badge = New-RoundedRectPath 8 8 240 240 54
+    $g.FillPath((New-DiagonalBrush 8 8 240 240 "#5B8AE6" "#203C78"), $badge)
+    if (-not $small) {
+        $hl = New-RoundedRectPath 8 8 240 130 54
+        $hlBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            (New-Object System.Drawing.RectangleF(0, 8, 256, 132)),
+            [System.Drawing.Color]::FromArgb(52, 255, 255, 255),
+            [System.Drawing.Color]::FromArgb(0, 255, 255, 255),
+            90.0
+        )
+        $g.FillPath($hlBrush, $hl)
+        $hlBrush.Dispose()
+        $hl.Dispose()
+    }
+
+    # ---- machine, back half ---------------------------------------------
+    # The page is drawn between the two halves of the machine, so it reads as
+    # coming out of an output slot rather than resting on a tray.
+    $bodyTop = 164.0
+    $bodyBottom = 222.0
+    if (-not $small) {
+        $seat = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(38, 6, 18, 44))
+        $seatPath = New-RoundedRectPath 40 212 176 12 6
+        $g.FillPath($seat, $seatPath)
+        $seat.Dispose(); $seatPath.Dispose()
+    }
+    $body = New-RoundedRectPath 22 $bodyTop 212 ($bodyBottom - $bodyTop) 18
+    $g.FillPath((New-VerticalBrush $bodyTop $bodyBottom "#E8F1FD" "#87A3CB"), $body)
+    $body.Dispose()
+
+    # ---- the sheet -------------------------------------------------------
+    $paperX = 73.0
+    $paperY = 16.0
+    $paperW = 110.0
+    $paperH = 151.0
+    $paper = New-PagePath $paperX $paperY $paperW $paperH 11
+    $g.FillPath((New-VerticalBrush $paperY ($paperY + $paperH) "#FFFDF7" "#F4ECDF"), $paper)
+
+    # Text lines: the document half of the mark.
+    $inkX = 87.0
+    $inkW = 82.0
+    $lineH = if ($tiny) { 15.0 } elseif ($small) { 12.0 } else { 8.0 }
+    $lineBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 104, 130, 172))
+    $paleBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 149, 169, 202))
+    if ($tiny) {
+        $rows = @(
+            @{ Y = 38.0; W = $inkW }
+        )
+    } elseif ($small) {
+        # Two lines are enough at 32 px, and they keep the sheet from turning
+        # into a grey smear.
+        $rows = @(
+            @{ Y = 36.0; W = $inkW },
+            @{ Y = 58.0; W = ($inkW * 0.66) }
+        )
+    } else {
+        $rows = @(
+            @{ Y = 34.0; W = $inkW },
+            @{ Y = 52.0; W = ($inkW * 0.72) },
+            @{ Y = 70.0; W = ($inkW * 0.88) }
+        )
+    }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $row = $rows[$i]
+        $bar = New-RoundedRectPath $inkX $row.Y $row.W $lineH ($lineH / 2)
+        if ($i -eq 0) { $g.FillPath($lineBrush, $bar) } else { $g.FillPath($paleBrush, $bar) }
+        $bar.Dispose()
+    }
+    $lineBrush.Dispose(); $paleBrush.Dispose()
+
+    # Photo thumbnail: the image half of the mark.
+    $photoY = if ($tiny) { 70.0 } else { 86.0 }
+    $photoH = if ($tiny) { 72.0 } else { 60.0 }
+    $photo = New-RoundedRectPath $inkX $photoY $inkW $photoH 7
+    $state = $g.Save()
+    $g.SetClip($photo, [System.Drawing.Drawing2D.CombineMode]::Replace)
+    $g.FillRectangle((New-VerticalBrush $photoY ($photoY + $photoH) "#FFD180" "#F2896E"), $inkX, $photoY, $inkW, $photoH)
+    # Sun.
+    $sun = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 248, 228))
+    $g.FillEllipse($sun, ($inkX + 52), ($photoY + 8), 17, 17)
+    $sun.Dispose()
+    # Hills, back then front. Left out at 16-24 px, where they only add noise.
+    if ($Size -ge 48) {
+    $back = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 92, 122, 172))
+    $backPts = @(
+        (New-Object System.Drawing.PointF(($inkX - 2), ($photoY + $photoH))),
+        (New-Object System.Drawing.PointF(($inkX + 23), ($photoY + 14))),
+        (New-Object System.Drawing.PointF(($inkX + 52), ($photoY + $photoH)))
     )
-    $g.FillPath($bgBrush, $bgPath)
-
-    # Soft highlight across the top.
-    $hlRect = New-Object System.Drawing.RectangleF(8, 8, 240, 118)
-    $hlPath = New-RoundedRectPath 8 8 240 118 54
-    $hlBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        $hlRect,
-        [System.Drawing.Color]::FromArgb(52, 255, 255, 255),
-        [System.Drawing.Color]::FromArgb(0, 255, 255, 255),
-        90.0
+    $g.FillPolygon($back, $backPts)
+    $back.Dispose()
+    $front = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 45, 73, 122))
+    $frontPts = @(
+        (New-Object System.Drawing.PointF(($inkX + 12), ($photoY + $photoH))),
+        (New-Object System.Drawing.PointF(($inkX + 53), ($photoY + 22))),
+        (New-Object System.Drawing.PointF(($inkX + 86), ($photoY + $photoH)))
     )
-    $g.FillPath($hlBrush, $hlPath)
+    $g.FillPolygon($front, $frontPts)
+    $front.Dispose()
+    }
+    $g.Restore($state)
+    $photo.Dispose()
 
-    # Soft shadow under the book.
-    $shadow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(52, 10, 22, 46))
-    $shadowPath = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $shadowPath.AddEllipse(40, 148, 176, 56)
-    $g.FillPath($shadow, $shadowPath)
+    if (-not $small) {
+        $edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(44, 146, 126, 92), 1.5)
+        $g.DrawPath($edge, $paper)
 
-    # Pages.
-    $paper = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 250, 246, 234))
-    $paperEdge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 225, 213, 187), 2.0)
+        # The machine's lip shades the page just above the slot.
+        $shade = New-Object System.Drawing.RectangleF(0, 146, 256, 28)
+        $shadeBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            $shade,
+            [System.Drawing.Color]::FromArgb(0, 32, 44, 72),
+            [System.Drawing.Color]::FromArgb(62, 32, 44, 72),
+            90.0
+        )
+        $g.SetClip($paper, [System.Drawing.Drawing2D.CombineMode]::Replace)
+        $g.FillRectangle($shadeBrush, 0, 146, 256, 28)
+        $g.ResetClip()
+        $shadeBrush.Dispose()
+    }
+    $paper.Dispose()
 
-    $left = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $left.StartFigure()
-    $left.AddBezier(128, 96, 101, 84, 74, 80, 52, 82)
-    $left.AddLine(52, 82, 52, 168)
-    $left.AddBezier(52, 168, 74, 166, 101, 172, 128, 186)
-    $left.CloseFigure()
-    $g.FillPath($paper, $left)
-    $g.DrawPath($paperEdge, $left)
+    # ---- slot rim --------------------------------------------------------
+    # A narrow darker bar along the machine's top edge: the page disappears
+    # under it, so it reads as the mouth of the output slot, and being only a
+    # few pixels tall it never looks like a shelf.
+    $rim = New-RoundedRectPath 24 ($bodyTop - 1) 208 5 2.5
+    $rimBrush = New-VerticalBrush ($bodyTop - 1) ($bodyTop + 4) "#96ADC9" "#B7C9E0"
+    $g.FillPath($rimBrush, $rim)
+    $rimBrush.Dispose(); $rim.Dispose()
 
-    $right = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $right.StartFigure()
-    $right.AddBezier(128, 96, 155, 84, 182, 80, 204, 82)
-    $right.AddLine(204, 82, 204, 168)
-    $right.AddBezier(204, 168, 182, 166, 155, 172, 128, 186)
-    $right.CloseFigure()
-    $g.FillPath($paper, $right)
-    $g.DrawPath($paperEdge, $right)
+    # Lid seam: a hairline just under the rim, which is what separates a
+    # printer's lid from its front face.
+    if (-not $small) {
+        $lidSeam = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(38, 96, 118, 158), 1.6)
+        $g.DrawLine($lidSeam, 30, 174.5, 226, 174.5)
+        $lidSeam.Dispose()
+    }
 
-    # Text lines on the pages.
-    $ink = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 150, 169, 202), 5.0)
-    $ink.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $ink.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $g.DrawLine($ink, 68, 118, 110, 113)
-    $g.DrawLine($ink, 68, 138, 110, 133)
-    $g.DrawLine($ink, 70, 158, 98, 154)
-    $g.DrawLine($ink, 146, 113, 188, 118)
-    $g.DrawLine($ink, 146, 133, 188, 138)
-    $g.DrawLine($ink, 158, 154, 186, 158)
+    # Output slot on the front face: a dark slit reads as a printer even at
+    # 16 px, where every other machine detail has already disappeared.
+    $slotH = if ($small) { 9.0 } else { 7.0 }
+    $slot = New-RoundedRectPath 66 186 124 $slotH 3.5
+    $slotBrush = New-VerticalBrush 186 195 "#6F86AA" "#8CA2C1"
+    $g.FillPath($slotBrush, $slot)
+    $slotBrush.Dispose(); $slot.Dispose()
 
-    # Spine.
-    $spineBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 213, 195, 160))
-    $spine = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $spine.AddBezier(121, 92, 125, 90, 131, 90, 135, 92)
-    $spine.AddLine(135, 92, 135, 190)
-    $spine.AddBezier(135, 190, 131, 188, 125, 188, 121, 190)
-    $spine.CloseFigure()
-    $g.FillPath($spineBrush, $spine)
-
-    $spineShade = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(80, 118, 98, 64), 1.5)
-    $g.DrawLine($spineShade, 128, 95, 128, 187)
-
-    # Bookmark ribbon.
-    $ribbonBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 213, 86, 80))
-    $ribbon = New-Object System.Drawing.PointF[] 5
-    $ribbon[0] = New-Object System.Drawing.PointF(119, 86)
-    $ribbon[1] = New-Object System.Drawing.PointF(137, 86)
-    $ribbon[2] = New-Object System.Drawing.PointF(137, 148)
-    $ribbon[3] = New-Object System.Drawing.PointF(128, 138)
-    $ribbon[4] = New-Object System.Drawing.PointF(119, 148)
-    $g.FillPolygon($ribbonBrush, $ribbon)
+    if (-not $small) {
+        $led = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 96, 214, 199))
+        $g.FillEllipse($led, 200, 184, 9, 9)
+        $led.Dispose()
+    }
 
     $g.Dispose()
     return $bmp
 }
 
-$master = New-BookBitmap
-$master.Save((Join-Path $OutDir "icon-256.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+if (-not (Test-Path $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir | Out-Null
+}
 
 $sizes = @(16, 24, 32, 48, 64, 128, 256)
 $pngs = @()
 foreach ($size in $sizes) {
+    $bitmap = New-AppIcon -Size $size
     if ($size -eq $Canvas) {
-        $ms = New-Object System.IO.MemoryStream
-        $master.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-        $pngs += , $ms.ToArray()
-        $ms.Dispose()
-        continue
+        $bitmap.Save((Join-Path $OutDir "icon-256.png"), [System.Drawing.Imaging.ImageFormat]::Png)
     }
-
-    $small = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $sg = [System.Drawing.Graphics]::FromImage($small)
-    $sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $sg.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-    $sg.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-    $sg.Clear([System.Drawing.Color]::Transparent)
-    $dest = New-Object System.Drawing.Rectangle(0, 0, $size, $size)
-    $sg.DrawImage($master, $dest, 0, 0, $Canvas, $Canvas, [System.Drawing.GraphicsUnit]::Pixel)
-    $sg.Dispose()
-
     $ms = New-Object System.IO.MemoryStream
-    $small.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $pngs += , $ms.ToArray()
     $ms.Dispose()
-    $small.Dispose()
+    $bitmap.Dispose()
 }
-$master.Dispose()
 
 # Assemble an ICO whose entries are PNG images (supported since Windows Vista).
 $icoPath = Join-Path $OutDir "icon.ico"
