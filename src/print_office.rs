@@ -27,7 +27,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::core::PCWSTR;
 
 use crate::excel::{self, Workbook};
-use crate::print::{Device, ImagePrint, LayoutOutcome, PageRange, PrintFit, PrintSummary};
+use crate::print::{
+    Device, ImagePrint, LayoutOutcome, PageMargins, PageRange, PrintFit, PrintSummary,
+};
 use crate::word::{self, VAlign};
 
 thread_local! {
@@ -53,8 +55,6 @@ impl Drop for DrawingGuard {
     }
 }
 
-/// Margin around the printed content, in inches.
-pub(crate) const MARGIN_INCHES: f32 = 0.5;
 /// Word's default side margin of a table cell, in points (0.19 cm); cells
 /// carry nothing above or below, the line's own leading is the whole gap.
 const CELL_PADDING_PT: f32 = 5.4;
@@ -70,7 +70,6 @@ const LINE_COLOR: u32 = 0x808080;
 /// `stop_after` is the last page a preview needs; the rest of the document is
 /// then left unmeasured, which is what makes a long document open at once.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn print_word(
     device: &mut Device,
     document: &word::WordDocument,
@@ -82,6 +81,7 @@ pub fn print_word(
     range: &PageRange,
     stop_after: Option<usize>,
     fit_mode: PrintFit,
+    margins: PageMargins,
 ) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
     let hdc = device.hdc();
@@ -102,13 +102,30 @@ pub fn print_word(
     // where Word puts it. Drawing starts at the printable area, so the
     // unprintable border is subtracted first, and a margin narrower than the
     // border falls back to the printable edge.
-    let left = (document.margin_left * scale - hardware.0 as f32).max(0.0);
-    let top = (document.margin_top * scale - hardware.1 as f32).max(0.0);
-    let bottom = height as f32 - (document.margin_bottom * scale - hardware.1 as f32).max(0.0);
+    //
+    // 设定里的边距只会把文档自己的边距「撑开」，不会把它压窄：Word 文档按自己
+    // 声明的版式印，而 Markdown 这类没有页面设置的文档声明的是 0，正好由设定
+    // 决定留多少白边，不至于顶到纸边。留白也不能超过半张纸，否则没有正文可印。
+    let setting = (margins.inches() * dpi_x as f32).max(0.0);
+    let border = |margin: f32, extent: i32| margin.min(extent as f32 / 2.0 - 1.0).max(0.0);
+    let margin_left = border((document.margin_left * scale).max(setting), width);
+    let margin_right = border((document.margin_right * scale).max(setting), width);
+    let margin_top = border((document.margin_top * scale).max(setting), height);
+    let margin_bottom = border((document.margin_bottom * scale).max(setting), height);
+    let left = (margin_left - hardware.0 as f32).max(0.0);
+    let top = (margin_top - hardware.1 as f32).max(0.0);
+    let right = width as f32 - (margin_right - hardware.0 as f32).max(0.0);
+    let bottom = height as f32 - (margin_bottom - hardware.1 as f32).max(0.0);
+    // 页脚印在最下沿：给它让出两行，边距窄时最后一段正文不会压住页号。
+    let bottom = if device.has_footer() {
+        bottom.min(height as f32 - dpi_y as f32 / 4.0).max(top + 72.0)
+    } else {
+        bottom
+    };
     if bottom - top < 72.0 {
         return Err(String::from("页面边距超出了纸张高度"));
     }
-    let column_width = (document.content_width * scale).min((width as f32 - left).max(72.0));
+    let column_width = (document.content_width * scale).min((right - left).max(72.0));
 
     let mut fonts = Fonts::new(hdc, dpi_y as f32);
     let mut brushes = Brushes::default();
@@ -175,13 +192,22 @@ pub fn print_excel(
     range: &PageRange,
     stop_after: Option<usize>,
     fit_mode: PrintFit,
+    margins: PageMargins,
 ) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
     let hdc = device.hdc();
-    let margin_x = dpi_x as f32 * MARGIN_INCHES;
-    let margin_y = dpi_y as f32 * MARGIN_INCHES;
+    let margin_x = (dpi_x as f32 * margins.inches()).max(0.0);
+    let margin_y = (dpi_y as f32 * margins.inches()).max(0.0);
+    let margin_x = margin_x.min(width as f32 / 2.0 - 1.0).max(0.0);
+    let margin_y = margin_y.min(height as f32 / 2.0 - 1.0).max(0.0);
     let printable_width = width as f32 - 2.0 * margin_x;
     let printable_height = height as f32 - 2.0 * margin_y;
+    // 页脚印在最下沿：行高不缩，只把每页能排的高度让出两行给页号。
+    let printable_height = if device.has_footer() {
+        (printable_height - dpi_y as f32 / 4.0).max(72.0)
+    } else {
+        printable_height
+    };
     if printable_width < 72.0 || printable_height < 72.0 {
         return Err(String::from("打印机没有足够的可打印区域"));
     }
@@ -276,12 +302,15 @@ pub fn print_image(
     dpi_y: i32,
     range: &PageRange,
     print: ImagePrint,
+    margins: PageMargins,
 ) -> Result<LayoutOutcome, String> {
     let _drawing = DrawingGuard;
     let hdc = device.hdc();
 
-    let margin_x = dpi_x as f32 * MARGIN_INCHES;
-    let margin_y = dpi_y as f32 * MARGIN_INCHES;
+    let margin_x = (dpi_x as f32 * margins.inches()).max(0.0);
+    let margin_y = (dpi_y as f32 * margins.inches()).max(0.0);
+    let margin_x = margin_x.min(width as f32 / 2.0 - 1.0).max(0.0);
+    let margin_y = margin_y.min(height as f32 / 2.0 - 1.0).max(0.0);
     let printable_width = width as f32 - 2.0 * margin_x;
     let printable_height = height as f32 - 2.0 * margin_y;
     if printable_width < 72.0 || printable_height < 72.0 {
@@ -2022,7 +2051,18 @@ mod tests {
     fn print_pictures(pixels: &RgbaImage, print: ImagePrint) -> Vec<RgbaImage> {
         let geometry = SheetGeometry::without_margins(300, 300);
         let mut device = Device::sheet(geometry).expect("sheet");
-        print_image(&mut device, pixels, 300, 300, 96, 96, &PageRange::All, print).expect("print");
+        print_image(
+            &mut device,
+            pixels,
+            300,
+            300,
+            96,
+            96,
+            &PageRange::All,
+            print,
+            PageMargins::default(),
+        )
+        .expect("print");
         device
             .into_pages()
             .into_iter()
@@ -2190,6 +2230,7 @@ mod tests {
             96,
             &PageRange::Pages(vec![(2, 2)]),
             print,
+            PageMargins::default(),
         )
         .expect("print");
 

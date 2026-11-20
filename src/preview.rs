@@ -27,14 +27,16 @@ use gpui_kit::*;
 use image::Frame;
 
 use crate::print::{
-    self, ImageAnchor, ImagePrint, ImageScale, Orientation, PageRange, PagesPerSheet,
-    PrintContent, PrintFit, PrintJob, SheetGeometry,
+    self, ImageAnchor, ImagePrint, ImageScale, Orientation, PageMargins, PageRange,
+    PagesPerSheet, PrintContent, PrintFit, PrintJob, SheetGeometry,
 };
 use crate::settings::ReadingBackground;
 use crate::{APP_ICON, PDF_PAGE_GAP, PDF_PAGE_MARGIN, PDF_TOP_PADDING};
 
 /// 页号按钮的小图标：一个字母「n」，对应页脚印的「n / m」。
 const PAGE_NUMBER_ICON: &[u8] = include_bytes!("../assets/icons/page-number.svg");
+/// 页边距按钮的小图标：一张纸，里面还画了一圈正文区的框。
+const MARGINS_ICON: &[u8] = include_bytes!("../assets/icons/margins.svg");
 
 /// 预览位图的分辨率。位图只用来显示，144 dpi 缩到屏幕宽度仍然清晰。
 pub(crate) const PREVIEW_DPI: f32 = 144.0;
@@ -601,7 +603,7 @@ impl PreviewWindow {
     /// 页上摆的那一层必须用同一块，松开左键换成位图才不会跳一下。
     fn image_area(&self) -> (f32, f32, f32, f32) {
         let sheet = self.info.sheet;
-        let margin = PREVIEW_DPI * crate::print_office::MARGIN_INCHES;
+        let margin = PREVIEW_DPI * self.job.margins.inches();
         (
             sheet.origin_x as f32 + margin,
             sheet.origin_y as f32 + margin,
@@ -771,6 +773,34 @@ impl PreviewWindow {
         self.relayout(cx);
     }
 
+    /// 换页边距，由预览自己发起：主窗口也要跟着改。
+    pub(crate) fn set_margins(&mut self, margins: PageMargins, cx: &mut Context<Self>) {
+        self.set_margins_from(margins, true, cx);
+    }
+
+    /// 换页边距：纸还是那张纸，能落墨的那一块变了，页要整页重排。
+    ///
+    /// 图片拖动时对齐的那块区域也跟着换，见 [`Self::image_area`]。
+    pub(crate) fn set_margins_from(
+        &mut self,
+        margins: PageMargins,
+        report: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.job.margins == margins {
+            return;
+        }
+        self.job.margins = margins;
+        if report {
+            self.reader
+                .update(cx, |reader, cx| {
+                    reader.remember_print_margins(margins, cx)
+                })
+                .ok();
+        }
+        self.relayout(cx);
+    }
+
     /// 换纸张方向。
     ///
     /// 横过来的纸更宽也更矮，每行能放下的字和每页的行数都变了，所以预览要整页
@@ -884,6 +914,7 @@ impl PreviewWindow {
                             image: ImagePrint::default(),
                             // 裁下来的不是整页，页号没有意义。
                             page_number: false,
+                            margins: this.job.margins,
                         };
                         crate::run_print_job(job, window, cx);
                     })
@@ -1625,6 +1656,31 @@ impl PreviewWindow {
                 })
         };
 
+        // 正文四周留多宽的白边：选完立刻在纸上看到，缩印时每小页各留一份。
+        let margins = {
+            let view = cx.entity();
+            let current = self.job.margins;
+            chip_button("preview-margins")
+                .icon(Icon::default().data(MARGINS_ICON))
+                .label(current.button_label())
+                .tooltip("打印页边距：正文四周留出的白边，缩印时每个小页各留一份")
+                .tooltip_show_delay(TOOLTIP_DELAY)
+                .dropdown_menu(move |menu, _window, _cx| {
+                    let mut menu = menu.min_w(px(170.)).label("打印页边距");
+                    for margins in PageMargins::ALL {
+                        let view = view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(margins.label())
+                                .checked(margins == current)
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.set_margins(margins, cx));
+                                }),
+                        );
+                    }
+                    menu
+                })
+        };
+
         let mut page_label = match self.total {
             Some(total) => format!("第 {} / {} 页", current + 1, total),
             // The page in front of the reader is already drawn; only the pages
@@ -1684,6 +1740,7 @@ impl PreviewWindow {
             .child(orientation)
             .child(pages_per_sheet)
             .child(page_number)
+            .child(margins)
             .child(divider())
             .child(print_visible)
             .child(print)
@@ -1748,6 +1805,7 @@ mod tests {
             pages_per_sheet: print::PagesPerSheet::One,
             image: print::ImagePrint::default(),
             page_number: false,
+            margins: print::PageMargins::default(),
         }
     }
 
@@ -1848,6 +1906,7 @@ mod tests {
             pages_per_sheet: print::PagesPerSheet::One,
             image: print::ImagePrint::default(),
             page_number: false,
+            margins: print::PageMargins::default(),
         };
 
         let range = PageRange::Pages(vec![(1, 1)]);

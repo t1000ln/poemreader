@@ -49,6 +49,66 @@ pub struct PrintJob {
     pub image: ImagePrint,
     /// Whether every page carries a "n / m" footer.
     pub page_number: bool,
+    /// How much white space is left around the content on each page.
+    pub margins: PageMargins,
+}
+
+/// 打印时正文四周留出的白边。
+///
+/// 这是排版用的边距，落在打印机自己不可打印的边框之内；纸张再小也不会窄到
+/// 把正文挤没，缩印时每一小页各自留一份。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageMargins {
+    /// 铺满可打印区域，只有打印机自己的边框。
+    None,
+    /// 6 毫米，挤得下更多字。
+    Narrow,
+    /// 12.7 毫米，Word 与通常打印的惯用值。
+    #[default]
+    Normal,
+    /// 25.4 毫米，留白宽，页面上字少。
+    Wide,
+}
+
+impl PageMargins {
+    /// The choices the print controls offer, in order.
+    pub const ALL: [Self; 4] = [
+        PageMargins::None,
+        PageMargins::Narrow,
+        PageMargins::Normal,
+        PageMargins::Wide,
+    ];
+
+    /// How wide the border on each side is, in inches.
+    pub fn inches(self) -> f32 {
+        match self {
+            PageMargins::None => 0.0,
+            PageMargins::Narrow => 0.25,
+            PageMargins::Normal => 0.5,
+            PageMargins::Wide => 1.0,
+        }
+    }
+
+    /// The caption shown on the print controls.
+    pub fn label(self) -> &'static str {
+        match self {
+            PageMargins::None => "无边距",
+            PageMargins::Narrow => "窄（0.6 厘米）",
+            PageMargins::Normal => "普通（1.3 厘米）",
+            PageMargins::Wide => "宽（2.5 厘米）",
+        }
+    }
+
+    /// 工具栏按钮上的标签：这一排按钮地方紧，省掉括号里的厘米数。
+    pub fn button_label(self) -> &'static str {
+        match self {
+            PageMargins::None => "无边距",
+            PageMargins::Narrow => "窄边距",
+            PageMargins::Normal => "普通边距",
+            PageMargins::Wide => "宽边距",
+        }
+    }
 }
 
 /// Which way round the sheet is printed.
@@ -815,6 +875,12 @@ mod surface {
             });
         }
 
+        /// Whether pages carry a "n / m" footer, so the layout can leave it
+        /// room at the bottom of the page.
+        pub(crate) fn has_footer(&self) -> bool {
+            self.footer.is_some()
+        }
+
         /// Begin page `index`.
         pub(crate) fn start_page(&mut self, index: usize) -> Result<(), String> {
             let _ = index;
@@ -1084,8 +1150,8 @@ pub fn print(owner: PrintOwner, job: PrintJob) -> Result<Option<PrintSummary>, S
 #[cfg(windows)]
 mod imp {
     use super::{
-        Device, LayoutOutcome, Orientation, PageRange, PrintContent, PrintJob, PrintOwner,
-        PrintSummary, RenderedPages, SheetGeometry,
+        Device, LayoutOutcome, Orientation, PageMargins, PageRange, PrintContent, PrintJob,
+        PrintOwner, PrintSummary, RenderedPages, SheetGeometry,
     };
 
     use std::ffi::c_void;
@@ -1110,9 +1176,6 @@ mod imp {
         PRINTDLGEXW, PRINTPAGERANGE, PrintDlgExW,
     };
     use windows::core::{PCWSTR, w};
-
-    /// Margin around the printed area, in inches.
-    const MARGIN_INCHES: f32 = 0.5;
 
     /// Upper page bound offered when the page count is only known after layout.
     const UNKNOWN_PAGE_LIMIT: u32 = 9999;
@@ -1168,9 +1231,10 @@ mod imp {
                             dpi_y,
                             &empty,
                             None,
+                            job.margins,
                         )?,
                         PrintContent::Pdf(source) => {
-                            print_pdf(&mut probe, source, width, height, dpi_x, dpi_y, &empty)?
+                            print_pdf(&mut probe, source, width, height, dpi_x, dpi_y, &empty, job.margins)?
                         }
                         PrintContent::Word(document) => crate::print_office::print_word(
                             &mut probe,
@@ -1183,6 +1247,7 @@ mod imp {
                             &empty,
                             None,
                             job.fit,
+                            job.margins,
                         )?,
                         PrintContent::Excel(workbook) => crate::print_office::print_excel(
                             &mut probe,
@@ -1194,6 +1259,7 @@ mod imp {
                             &empty,
                             None,
                             job.fit,
+                            job.margins,
                         )?,
                         PrintContent::Image { pixels } => crate::print_office::print_image(
                             &mut probe,
@@ -1204,6 +1270,7 @@ mod imp {
                             dpi_y,
                             &empty,
                             job.image,
+                            job.margins,
                         )?,
                     };
                     outcome.summary.total.max(1)
@@ -1250,9 +1317,10 @@ mod imp {
                 dpi_y,
                 &range,
                 None,
+                job.margins,
             ),
             PrintContent::Pdf(source) => {
-                print_pdf(&mut device, source, width, height, dpi_x, dpi_y, &range)
+                print_pdf(&mut device, source, width, height, dpi_x, dpi_y, &range, job.margins)
             }
             PrintContent::Word(document) => crate::print_office::print_word(
                 &mut device,
@@ -1265,6 +1333,7 @@ mod imp {
                 &range,
                 None,
                 job.fit,
+                job.margins,
             ),
             PrintContent::Excel(workbook) => crate::print_office::print_excel(
                 &mut device,
@@ -1276,6 +1345,7 @@ mod imp {
                 &range,
                 None,
                 job.fit,
+                job.margins,
             ),
             PrintContent::Image { pixels } => crate::print_office::print_image(
                 &mut device,
@@ -1286,6 +1356,7 @@ mod imp {
                 dpi_y,
                 &range,
                 job.image,
+                job.margins,
             ),
         };
 
@@ -1364,9 +1435,10 @@ mod imp {
                 dpi,
                 range,
                 stop_after,
+                job.margins,
             ),
             PrintContent::Pdf(source) => {
-                print_pdf(&mut device, source, width, height, dpi, dpi, range)
+                print_pdf(&mut device, source, width, height, dpi, dpi, range, job.margins)
             }
             PrintContent::Word(document) => crate::print_office::print_word(
                 &mut device,
@@ -1379,6 +1451,7 @@ mod imp {
                 range,
                 stop_after,
                 job.fit,
+                job.margins,
             ),
             PrintContent::Excel(workbook) => crate::print_office::print_excel(
                 &mut device,
@@ -1390,6 +1463,7 @@ mod imp {
                 range,
                 stop_after,
                 job.fit,
+                job.margins,
             ),
             PrintContent::Image { pixels } => crate::print_office::print_image(
                 &mut device,
@@ -1400,6 +1474,7 @@ mod imp {
                 dpi,
                 range,
                 job.image,
+                job.margins,
             ),
         }?;
 
@@ -1624,10 +1699,14 @@ mod imp {
         dpi_y: i32,
         range: &PageRange,
         stop_after: Option<usize>,
+        margins: PageMargins,
     ) -> Result<LayoutOutcome, String> {
         let hdc = device.hdc();
-        let margin_x = (dpi_x as f32 * MARGIN_INCHES) as i32;
-        let margin_y = (dpi_y as f32 * MARGIN_INCHES) as i32;
+        let margin_x = (dpi_x as f32 * margins.inches()) as i32;
+        let margin_y = (dpi_y as f32 * margins.inches()) as i32;
+        // A border wider than the paper would leave nothing to print on.
+        let margin_x = margin_x.min(width / 2 - 1).max(0);
+        let margin_y = margin_y.min(height / 2 - 1).max(0);
         let left = margin_x;
         let top = margin_y;
         let right = width - margin_x;
@@ -1674,6 +1753,14 @@ mod imp {
         let _ = unsafe { GetTextExtentPoint32W(hdc, &sample, &mut extent) };
         let line_height = ((extent.cy.max(1) as f32) * 1.45).round() as i32;
         let line_height = line_height.max(1);
+        // 页脚印在可打印区域的最下沿：边距窄到正文贴底时给它让出两行，
+        // 免得最后一行压在页号上。
+        let bottom = if device.has_footer() {
+            let room = (height - 2 * line_height).max(top + line_height);
+            bottom.min(room)
+        } else {
+            bottom
+        };
 
         // Wrap every source line to the printable width and run the pages as the
         // rows are produced.
@@ -1843,10 +1930,13 @@ mod imp {
         dpi_x: i32,
         dpi_y: i32,
         range: &PageRange,
+        margins: PageMargins,
     ) -> Result<LayoutOutcome, String> {
         let hdc = device.hdc();
-        let margin_x = (dpi_x as f32 * MARGIN_INCHES) as i32;
-        let margin_y = (dpi_y as f32 * MARGIN_INCHES) as i32;
+        let margin_x = (dpi_x as f32 * margins.inches()) as i32;
+        let margin_y = (dpi_y as f32 * margins.inches()) as i32;
+        let margin_x = margin_x.min(width / 2 - 1).max(0);
+        let margin_y = margin_y.min(height / 2 - 1).max(0);
         let available_width = (width - 2 * margin_x).max(1);
         let available_height = (height - 2 * margin_y).max(1);
 
@@ -2124,6 +2214,7 @@ mod tests {
             pages_per_sheet: PagesPerSheet::One,
             image: ImagePrint::default(),
             page_number: false,
+            margins: PageMargins::default(),
         }
     }
 
@@ -2245,6 +2336,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 页边距是排版时真正让出来的位置，不只是预览上画的一圈白框：边距调宽，
+    /// 正文就往后挪，纸上左边那一条空白跟着变宽。
+    #[test]
+    fn a_wider_margin_moves_the_text_inwards() {
+        let sheet = SheetGeometry::without_margins(600, 800);
+        let render = |margins: PageMargins| {
+            let mut job = text_job(20);
+            job.margins = margins;
+            let (_, pages) =
+                render_pages(&job, sheet, 96.0, &PageRange::All, None, None).expect("layout");
+            pages.into_iter().next().expect("one page").1
+        };
+
+        // 96 dpi 下「无边距」从纸的左上角起笔，「宽」则让出 96 像素。
+        let none = render(PageMargins::None);
+        assert!(has_ink(&none, 0, 0, 24, 200), "无边距时正文贴着纸边");
+
+        let wide = render(PageMargins::Wide);
+        assert!(
+            !has_ink(&wide, 0, 0, 90, 400),
+            "宽边距左边那一条应当留白"
+        );
+        assert!(has_ink(&wide, 90, 0, 120, 400), "宽边距时正文在留白之内");
     }
 
     /// 预览滚动到后面时只画读者面前的那几张。纸号得按文档来数：若从 0 重新

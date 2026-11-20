@@ -60,8 +60,8 @@ use pdf::PdfView;
 use picture::Picture;
 use preview::{PreviewWindow, open as open_preview_window};
 use print::{
-    ImageAnchor, ImagePrint, ImageScale, Orientation, PagesPerSheet, PrintContent, PrintFit,
-    PrintJob,
+    ImageAnchor, ImagePrint, ImageScale, Orientation, PageMargins, PagesPerSheet, PrintContent,
+    PrintFit, PrintJob,
 };
 use render::excel::{ExcelRender, excel_cells};
 use render::pdf::{PdfLayout, spawn_pdf_render};
@@ -345,6 +345,8 @@ pub(crate) struct PoemReader {
     pages_per_sheet: PagesPerSheet,
     /// 每页页脚要不要印「n / m」页号。预览里改过之后同样带到这里。
     page_number: bool,
+    /// 正文四周留多宽的白边。菜单里选，预览里印出来的纸就是它。
+    print_margins: PageMargins,
     /// 图片怎么印：印多大、从画面哪一块开始、要不要拼成多页。
     image_print: ImagePrint,
     background: ReadingBackground,
@@ -409,11 +411,19 @@ impl PoemReader {
                 settings.print_params.clone(),
             )
         };
-        let (print_fit, print_orientation, pages_per_sheet, page_number, mut image_print) = (
+        let (
+            print_fit,
+            print_orientation,
+            pages_per_sheet,
+            page_number,
+            print_margins,
+            mut image_print,
+        ) = (
             print_params.fit,
             print_params.orientation,
             print_params.pages_per_sheet,
             print_params.page_number,
+            print_params.margins,
             print_params.image,
         );
         image_print.anchor = image_print.anchor.clamped();
@@ -443,6 +453,7 @@ impl PoemReader {
             print_fit,
             pages_per_sheet,
             page_number,
+            print_margins,
             image_print,
             background,
             pointer_mode,
@@ -484,6 +495,7 @@ impl PoemReader {
                 pages_per_sheet: self.pages_per_sheet,
                 image: self.image_print,
                 page_number: self.page_number,
+                margins: self.print_margins,
             };
         }
         self.persist_settings();
@@ -871,6 +883,28 @@ impl PoemReader {
         cx.notify();
     }
 
+    /// 选择页边距：记下来，并且让正开着的预览一起换过去。
+    pub(crate) fn set_print_margins(
+        &mut self,
+        margins: PageMargins,
+        cx: &mut Context<Self>,
+    ) {
+        if self.print_margins == margins {
+            return;
+        }
+        self.print_margins = margins;
+        self.persist_print_params();
+        if let Some(preview) = &self.preview {
+            // 主窗口自己的实体正被借用着，预览不能反过来碰它。
+            preview
+                .view
+                .update(cx, |preview, cx| {
+                    preview.set_margins_from(margins, false, cx)
+                });
+        }
+        cx.notify();
+    }
+
     /// 图片怎么印：记下来，并且让正开着的预览一起换过去。
     pub(crate) fn set_image_print(&mut self, print: ImagePrint, cx: &mut Context<Self>) {
         if self.image_print == print {
@@ -960,6 +994,20 @@ impl PoemReader {
             return;
         }
         self.print_fit = fit;
+        self.persist_print_params();
+        cx.notify();
+    }
+
+    /// 预览窗口换了页边距，记下来即可。
+    pub(crate) fn remember_print_margins(
+        &mut self,
+        margins: PageMargins,
+        cx: &mut Context<Self>,
+    ) {
+        if self.print_margins == margins {
+            return;
+        }
+        self.print_margins = margins;
         self.persist_print_params();
         cx.notify();
     }
@@ -1082,6 +1130,7 @@ impl PoemReader {
             pages_per_sheet: self.pages_per_sheet,
             image: self.image_print,
             page_number: self.page_number,
+            margins: self.print_margins,
         })
     }
 
@@ -1525,6 +1574,7 @@ impl PoemReader {
         let background = self.background;
         let orientation = self.print_orientation;
         let self_pages = self.pages_per_sheet;
+        let self_margins = self.print_margins;
         let image_scale = self.image_print;
         let is_image = matches!(
             self.document.as_ref().map(|document| &document.content),
@@ -1544,6 +1594,15 @@ impl PoemReader {
                 .checked(pages == current)
                 .on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| this.set_pages_per_sheet(pages, cx));
+                })
+        };
+
+        // 菜单里的一行页边距，勾在当前的选择上。
+        let margins_item = |margins: PageMargins, current: PageMargins, view: Entity<Self>| {
+            PopupMenuItem::new(margins.label())
+                .checked(margins == current)
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.set_print_margins(margins, cx));
                 })
         };
 
@@ -1662,6 +1721,12 @@ impl PoemReader {
                             self_pages,
                             view.clone(),
                         ));
+
+                    // 正文四周留多少白边：缩印时每一小页各自留一份，页数会跟着变。
+                    menu = menu.separator().item(PopupMenuItem::label("打印页边距"));
+                    for margins in PageMargins::ALL {
+                        menu = menu.item(margins_item(margins, self_margins, view.clone()));
+                    }
 
                     // 图片没有版式，能缩放的只有画面本身，所以这一组只在看图
                     // 时出现。

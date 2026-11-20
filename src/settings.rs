@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::print::{ImagePrint, Orientation, PagesPerSheet, PrintFit};
+use crate::print::{ImagePrint, Orientation, PageMargins, PagesPerSheet, PrintFit};
 
 /// Reading colour scheme, persisted by name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +54,8 @@ pub struct PrintParams {
     pub image: ImagePrint,
     /// 页脚要不要印「n / m」页号。
     pub page_number: bool,
+    /// 正文四周留多宽的白边。
+    pub margins: PageMargins,
 }
 
 impl Default for PrintParams {
@@ -64,6 +66,7 @@ impl Default for PrintParams {
             pages_per_sheet: PagesPerSheet::default(),
             image: ImagePrint::default(),
             page_number: false,
+            margins: PageMargins::default(),
         }
     }
 }
@@ -225,6 +228,7 @@ mod tests {
             pages_per_sheet: PagesPerSheet::Four,
             image,
             page_number: true,
+            margins: PageMargins::Wide,
         };
 
         let text = serde_json::to_string(&params).expect("serialize");
