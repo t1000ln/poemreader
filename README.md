@@ -1,6 +1,7 @@
 # PoemReader
 
-使用 [GPUI Kit](https://gpui-kit.com)（GPUI + GPUI Component）构建的极简阅读器。
+使用 [GPUI Kit](https://gpui-kit.com)（GPUI + GPUI Component）构建的极简阅读器和打印工具，方便简单查看和快速打印，没有任何编辑修改功能！
+当前版本仅支持`Win64`环境。
 
 ![PoemReader 图标](assets/icon-256.png)
 
