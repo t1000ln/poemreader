@@ -595,38 +595,50 @@ fn parse_sheet(stream: &[u8], start: usize, name: &str, globals: &Globals) -> Le
                 let column = read_u16(data, 2) as u32;
                 let xf = (read_u16(data, 4) as usize).min(globals.styles.len().saturating_sub(1));
                 let result = &data[6..14];
-                match result {
-                    // A string result arrives in the next STRING record.
-                    [0x00, ..] => pending_string = Some((row, column, xf)),
-                    [0x01, _, flag, ..] => cells.push(LegacyCell {
-                        row,
-                        column,
-                        text: if *flag == 0 {
-                            String::from("FALSE")
-                        } else {
-                            String::from("TRUE")
-                        },
-                        style: xf,
-                        numeric: false,
-                    }),
-                    [0x02, _, flag, ..] => cells.push(LegacyCell {
-                        row,
-                        column,
-                        text: error_text(*flag).to_string(),
-                        style: xf,
-                        numeric: false,
-                    }),
-                    [0x03, _, ..] => cells.push(LegacyCell {
-                        row,
-                        column,
-                        text: String::new(),
-                        style: xf,
-                        numeric: false,
-                    }),
-                    _ => {
-                        let value = read_f64(result, 0);
-                        cells.push(number_cell(row, column, xf, value, globals));
+                // BIFF8 marks a non-numeric result with 0xFFFF in the last
+                // two bytes; anything else is an ordinary IEEE754 double,
+                // whose first byte can be any value. The special value lives
+                // in byte 1, not byte 2 (byte 2 is reserved).
+                if result[6] == 0xFF && result[7] == 0xFF {
+                    match result[0] {
+                        // A string result arrives in the next STRING record.
+                        0x00 => pending_string = Some((row, column, xf)),
+                        0x01 => cells.push(LegacyCell {
+                            row,
+                            column,
+                            text: if result[1] == 0 {
+                                String::from("FALSE")
+                            } else {
+                                String::from("TRUE")
+                            },
+                            style: xf,
+                            numeric: false,
+                        }),
+                        0x02 => cells.push(LegacyCell {
+                            row,
+                            column,
+                            text: error_text(result[1]).to_string(),
+                            style: xf,
+                            numeric: false,
+                        }),
+                        0x03 => cells.push(LegacyCell {
+                            row,
+                            column,
+                            text: String::new(),
+                            style: xf,
+                            numeric: false,
+                        }),
+                        _ => cells.push(LegacyCell {
+                            row,
+                            column,
+                            text: String::new(),
+                            style: xf,
+                            numeric: false,
+                        }),
                     }
+                } else {
+                    let value = read_f64(result, 0);
+                    cells.push(number_cell(row, column, xf, value, globals));
                 }
             }
             STRING => {
@@ -999,5 +1011,55 @@ mod tests {
         assert_eq!(ext.font, Some(0xFFFFFF));
         assert_eq!(ext.border_top, Some(0xBFBFBF));
         assert_eq!(ext.border_bottom, None);
+    }
+
+    fn formula_stream(result: [u8; 8]) -> Vec<u8> {
+        let mut data = vec![0u8; 14];
+        // row 0, column 0, xf 0, then the 8-byte FORMULA result.
+        data[6..14].copy_from_slice(&result);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&FORMULA.to_le_bytes());
+        stream.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        stream.extend_from_slice(&data);
+        stream
+    }
+
+    fn formula_cells(result: [u8; 8]) -> Vec<LegacyCell> {
+        let styles: Vec<CellStyle> = Vec::new();
+        let strings: Vec<String> = Vec::new();
+        let globals = Globals {
+            date1904: false,
+            styles: &styles,
+            strings: &strings,
+        };
+        parse_sheet(&formula_stream(result), 0, "表", &globals).cells
+    }
+
+    /// 2.0 in little-endian IEEE754 starts with 0x00. It used to be mistaken
+    /// for a string result and the cell was dropped entirely.
+    #[test]
+    fn a_numeric_formula_result_is_not_treated_as_a_string() {
+        let cells = formula_cells(2.0f64.to_le_bytes());
+        assert_eq!(cells.len(), 1, "a numeric formula still produces a cell");
+        assert!(
+            cells[0].text.contains('2'),
+            "the number is kept: {:?}",
+            cells[0].text
+        );
+        assert!(cells[0].numeric);
+    }
+
+    /// Special results keep their type in byte 0 and their value in byte 1;
+    /// byte 2 is reserved and used to be read as the value.
+    #[test]
+    fn boolean_and_error_formula_results_read_the_value_byte() {
+        let cells = formula_cells([0x01, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(cells[0].text, "TRUE");
+
+        let cells = formula_cells([0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(cells[0].text, "FALSE");
+
+        let cells = formula_cells([0x02, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(cells[0].text, "#DIV/0!");
     }
 }

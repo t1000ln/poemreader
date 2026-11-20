@@ -27,8 +27,8 @@ use gpui_kit::*;
 use image::Frame;
 
 use crate::print::{
-    self, ImageAnchor, ImagePrint, ImageScale, Orientation, PageMargins, PageRange,
-    PagesPerSheet, PrintContent, PrintFit, PrintJob, SheetGeometry,
+    self, ImageAnchor, ImagePrint, ImageScale, Orientation, PageMargins, PageRange, PagesPerSheet,
+    PrintContent, PrintFit, PrintJob, SheetGeometry,
 };
 use crate::settings::ReadingBackground;
 use crate::{APP_ICON, PDF_PAGE_GAP, PDF_PAGE_MARGIN, PDF_TOP_PADDING};
@@ -183,7 +183,14 @@ fn printer_paper() -> Option<PageInfo> {
     }
     let name = String::from_utf16_lossy(&buffer[..(needed as usize).saturating_sub(1)]);
 
-    let dc = unsafe { CreateDCW(w!("WINSPOOL"), PCWSTR(buffer.as_ptr()), PCWSTR::null(), None) };
+    let dc = unsafe {
+        CreateDCW(
+            w!("WINSPOOL"),
+            PCWSTR(buffer.as_ptr()),
+            PCWSTR::null(),
+            None,
+        )
+    };
     if dc.0.is_null() {
         return None;
     }
@@ -344,16 +351,12 @@ fn ranges_of(pages: &[usize]) -> PageRange {
     }
 }
 
-/// 预览编号，用来区分同一份文档的多次排版。
+/// 预览编号，用来区分同一份文档的多次排版。全局递增：一个进程里可以同时
+/// 有几个预览窗口，thread_local 的计数器在不同线程上会重复。
 fn next_generation() -> u64 {
-    thread_local! {
-        static COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-    COUNTER.with(|counter| {
-        let next = counter.get().wrapping_add(1);
-        counter.set(next);
-        next
-    })
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
 /// 预览窗口的大小与位置：盖在主窗口中间，比主窗口略小。
@@ -427,6 +430,9 @@ pub(crate) struct PreviewWindow {
     cache: HashMap<usize, Arc<RenderImage>>,
     /// 正在后台排版的页。
     rendering: HashSet<usize>,
+    /// 排版时确认不存在的页。总页数还没数出来时按估算值占位，滚到底会请求
+    /// 文档之外的页；记下来免得每一帧都重新排队后台排版。
+    unavailable: HashSet<usize>,
     /// 正在后台数总页数。
     counting: bool,
     /// 已经数过一次，失败也不反复重试。
@@ -477,6 +483,7 @@ impl PreviewWindow {
             generation: next_generation(),
             cache: HashMap::new(),
             rendering: HashSet::new(),
+            unavailable: HashSet::new(),
             counting: false,
             counted: false,
             total: None,
@@ -765,9 +772,7 @@ impl PreviewWindow {
         self.job.pages_per_sheet = pages;
         if report {
             self.reader
-                .update(cx, |reader, cx| {
-                    reader.remember_pages_per_sheet(pages, cx)
-                })
+                .update(cx, |reader, cx| reader.remember_pages_per_sheet(pages, cx))
                 .ok();
         }
         self.relayout(cx);
@@ -793,9 +798,7 @@ impl PreviewWindow {
         self.job.margins = margins;
         if report {
             self.reader
-                .update(cx, |reader, cx| {
-                    reader.remember_print_margins(margins, cx)
-                })
+                .update(cx, |reader, cx| reader.remember_print_margins(margins, cx))
                 .ok();
         }
         self.relayout(cx);
@@ -808,11 +811,7 @@ impl PreviewWindow {
     ///
     /// `report` 说明这次换向是预览自己发起的，要回写主窗口；主窗口发起时它
     /// 自己的实体正被借用着，再碰 `reader` 会撞上 GPUI 的重复借用而崩溃。
-    pub(crate) fn set_orientation(
-        &mut self,
-        orientation: Orientation,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn set_orientation(&mut self, orientation: Orientation, cx: &mut Context<Self>) {
         self.set_orientation_from(orientation, true, cx);
     }
 
@@ -842,6 +841,7 @@ impl PreviewWindow {
         self.generation = next_generation();
         self.cache.clear();
         self.rendering.clear();
+        self.unavailable.clear();
         self.stale.clear();
         self.image_dirty = false;
         self.footers_pending = false;
@@ -933,9 +933,9 @@ impl PreviewWindow {
 
     /// 可见区域落在第几页的哪一块。
     fn visible_region(&self, viewport: Size<f32>) -> Option<Region> {
-        let count = self.total.unwrap_or_else(|| {
-            Layout::estimate(&self.info, viewport, self.zoom)
-        });
+        let count = self
+            .total
+            .unwrap_or_else(|| Layout::estimate(&self.info, viewport, self.zoom));
         let layout = Layout::new(&self.info, viewport, self.zoom, count);
         let offset = self.scroll_offset();
         let x_offset = (-self.scroll_handle.offset().x.as_f32()).max(0.0);
@@ -1053,7 +1053,6 @@ impl PreviewWindow {
     /// 向默认打印机问纸张尺寸。打开驱动可能要几秒，所以放在后台，结果回来
     /// 之后再排版；在此之前界面只显示占位页。
     fn request_paper(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let generation = self.generation;
         cx.spawn_in(window, async move |this, cx| {
             let info = cx
                 .background_spawn(async move {
@@ -1063,7 +1062,7 @@ impl PreviewWindow {
                 })
                 .await;
             this.update_in(cx, move |this, _window, cx| {
-                this.finish_paper(generation, info);
+                this.finish_paper(info);
                 cx.notify();
             })
             .ok();
@@ -1100,7 +1099,14 @@ impl PreviewWindow {
                     // A document that cannot be laid out must not take the whole
                     // application down.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        print::render_pages(&job, sheet, PREVIEW_DPI, &range, stop_after, page_total)
+                        print::render_pages(
+                            &job,
+                            sheet,
+                            PREVIEW_DPI,
+                            &range,
+                            stop_after,
+                            page_total,
+                        )
                     }))
                     .ok()
                     .and_then(|result| result.ok())
@@ -1178,12 +1184,18 @@ impl PreviewWindow {
             // render_pages 返回文档页数；预览按张排版，缩印时换算成张数。
             self.doc_total = Some(total);
             self.total = Some(total.div_ceil(self.job.pages_per_sheet.count()));
+            // 页数已知后，之前按估算值标记为「不存在」的页要能重新请求。
+            self.unavailable.clear();
         }
     }
 
     /// 收到默认打印机的纸张尺寸。预览在此之前只显示占位页。
-    fn finish_paper(&mut self, generation: u64, info: PageInfo) {
-        if self.generation != generation || self.paper_known {
+    ///
+    /// 纸张只由打印机和方向决定，跟边距、页号这些排版设置无关，所以不能按
+    /// generation 丢弃：等驱动回话的几秒里改一次设置，被丢掉的结果加上仍为
+    /// true 的 `paper_requested`，会让预览永远停在「正在识别纸张」。
+    fn finish_paper(&mut self, info: PageInfo) {
+        if self.paper_known {
             return;
         }
         remember_paper(&info);
@@ -1221,9 +1233,18 @@ impl PreviewWindow {
                     self.total = Some(total.div_ceil(self.job.pages_per_sheet.count()));
                     // 页数是完整的，就不必再单独数一遍。
                     self.counted = true;
+                    self.unavailable.clear();
                 }
+                let painted: HashSet<usize> = pages.iter().map(|(index, _)| *index).collect();
                 for (index, image) in pages {
                     self.store(index, image, focus);
+                }
+                // 请求了却没交回来的页在文档之外（总数未知时按估算值占位会
+                // 请求到这种页）。记下来，否则每一帧都要重新排一遍。
+                for page in requested {
+                    if !painted.contains(page) {
+                        self.unavailable.insert(*page);
+                    }
                 }
                 if footerless {
                     self.footers_pending = true;
@@ -1314,6 +1335,7 @@ impl PreviewWindow {
             .filter(|index| {
                 (!self.cache.contains_key(index) || self.stale.contains(index))
                     && !self.rendering.contains(index)
+                    && !self.unavailable.contains(index)
             })
             .collect::<Vec<_>>();
         // The document still has to be measured to its end.
@@ -1367,9 +1389,9 @@ impl PreviewWindow {
                                 this.begin_image_drag(event, cx)
                             }),
                         )
-                        .on_mouse_move(cx.listener(
-                            |this, event: &MouseMoveEvent, _, cx| this.drag_image(event, cx),
-                        ))
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                            this.drag_image(event, cx)
+                        }))
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.end_image_drag(cx)),
@@ -1439,21 +1461,25 @@ impl PreviewWindow {
                             .child(content),
                     ),
             )
-            .child(div().absolute().inset_0().child(
-                Scrollbar::vertical(&self.scroll_handle)
-                    .id("preview-scrollbar")
-                    .mode(ScrollbarMode::Always)
-                    .viewport_from_layout(),
-            ));
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&self.scroll_handle)
+                        .id("preview-scrollbar")
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
+            );
 
         // A zoomed-in page can be wider than the window.
         if layout.content_width > viewport.width + 0.5 {
-            root = root.child(div().absolute().inset_0().child(
-                Scrollbar::horizontal(&self.scroll_handle)
-                    .id("preview-scrollbar-x")
-                    .mode(ScrollbarMode::Always)
-                    .viewport_from_layout(),
-            ));
+            root = root.child(
+                div().absolute().inset_0().child(
+                    Scrollbar::horizontal(&self.scroll_handle)
+                        .id("preview-scrollbar-x")
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
+            );
         }
 
         root.into_any_element()
@@ -1503,21 +1529,18 @@ impl PreviewWindow {
         };
 
         let close = chip_button("preview-close")
-            
             .icon(IconName::Close)
             .tooltip("关闭预览，不打印")
             .tooltip_show_delay(TOOLTIP_DELAY)
             .on_click(cx.listener(|_, _, window, _cx| window.remove_window()));
 
         let out = chip_button("preview-zoom-out")
-            
             .icon(IconName::Minus)
             .tooltip("把预览缩小一档（只影响屏幕上的显示）")
             .tooltip_show_delay(TOOLTIP_DELAY)
             .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.0 / ZOOM_STEP, cx)));
 
         let into = chip_button("preview-zoom-in")
-            
             .icon(IconName::Plus)
             .tooltip("把预览放大一档（只影响屏幕上的显示）")
             .tooltip_show_delay(TOOLTIP_DELAY)
@@ -1534,7 +1557,6 @@ impl PreviewWindow {
 
         // 「打印视图」印的是当前看得见的那一块，放大之后正好把细节印大。
         let print_visible = chip_button("preview-print-visible")
-            
             .icon(IconName::Eye)
             .label("打印视图…")
             .tooltip("只打印预览里看得见的那一块：放大之后印细节正合适")
@@ -1544,7 +1566,6 @@ impl PreviewWindow {
         let fit = self.fit_applies().then(|| {
             let other = self.job.fit.toggled();
             chip_button("preview-fit")
-                
                 .icon(IconName::Maximize)
                 .label(self.job.fit.label())
                 .tooltip(format!(
@@ -1565,7 +1586,6 @@ impl PreviewWindow {
             let view = cx.entity();
             let current = self.job.image.scale;
             chip_button("preview-image-scale")
-                
                 .icon(IconName::ResizeCorner)
                 .label(current.short_label())
                 .tooltip("图片印多大：100% 铺满可印区域，放大后画面会被裁掉或分成多页")
@@ -1590,7 +1610,6 @@ impl PreviewWindow {
         let poster = self.image_applies().then(|| {
             let on = self.job.image.poster;
             chip_button("preview-poster")
-                
                 .icon(IconName::GalleryVerticalEnd)
                 .label("拼接分页")
                 .selected(on)
@@ -1605,7 +1624,6 @@ impl PreviewWindow {
 
         // 按钮上写的是当前方向，点一下换另一种：预览里看到的就是纸横竖的样子。
         let orientation = chip_button("preview-orientation")
-            
             .icon(IconName::RotateCw)
             .label(self.job.orientation.label())
             .tooltip(format!(
@@ -1633,7 +1651,6 @@ impl PreviewWindow {
             let view = cx.entity();
             let current = self.job.pages_per_sheet;
             chip_button("preview-pages")
-
                 .icon(IconName::LayoutDashboard)
                 .label(current.label())
                 .tooltip("一张纸印几页：把多页缩小排在同一张纸上（缩印）")
@@ -1646,9 +1663,7 @@ impl PreviewWindow {
                             PopupMenuItem::new(pages.label())
                                 .checked(pages == current)
                                 .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.set_pages_per_sheet(pages, cx)
-                                    });
+                                    view.update(cx, |this, cx| this.set_pages_per_sheet(pages, cx));
                                 }),
                         );
                     }
@@ -1911,9 +1926,13 @@ mod tests {
 
         let range = PageRange::Pages(vec![(1, 1)]);
         let (total, pages) =
-            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, Some(0), None).expect("render");
+            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, Some(0), None)
+                .expect("render");
 
-        assert!(total.is_none(), "a stopped layout cannot know the page count");
+        assert!(
+            total.is_none(),
+            "a stopped layout cannot know the page count"
+        );
         assert_eq!(pages.len(), 1, "only the page asked for is painted");
         assert!(has_ink(&pages[0].1), "the painted page is blank");
     }
@@ -1935,7 +1954,8 @@ mod tests {
         ] {
             let job = job_of(&format!("samples/{name}"));
             let (total, pages) =
-                print::render_pages(&job, info.sheet, PREVIEW_DPI, &ranges, None, None).expect("render");
+                print::render_pages(&job, info.sheet, PREVIEW_DPI, &ranges, None, None)
+                    .expect("render");
 
             assert!(
                 total.is_some_and(|total| total >= 1),
@@ -1947,7 +1967,6 @@ mod tests {
             );
         }
     }
-
 
     /// 纵向与横向说的是同一张纸，只是摆法不同：尺寸互换，纸面标注跟着换，
     /// 而要两遍同样的方向不会来回翻。
@@ -1984,13 +2003,12 @@ mod tests {
         let job = job_of("samples/sample.xlsx");
         let range = PageRange::Pages(vec![(1, 1)]);
 
-        let (portrait, _) =
-            print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, None, None).expect("portrait");
-        let landscape_sheet = info
-            .oriented(print::Orientation::Landscape)
-            .sheet;
-        let (landscape, _) = print::render_pages(&job, landscape_sheet, PREVIEW_DPI, &range, None, None)
-            .expect("landscape");
+        let (portrait, _) = print::render_pages(&job, info.sheet, PREVIEW_DPI, &range, None, None)
+            .expect("portrait");
+        let landscape_sheet = info.oriented(print::Orientation::Landscape).sheet;
+        let (landscape, _) =
+            print::render_pages(&job, landscape_sheet, PREVIEW_DPI, &range, None, None)
+                .expect("landscape");
 
         let portrait = portrait.expect("the whole table was measured");
         let landscape = landscape.expect("the whole table was measured");
@@ -2018,5 +2036,4 @@ mod tests {
         );
         assert!((wide.width / wide.height - landscape.sheet.ratio()).abs() < 0.01);
     }
-
 }

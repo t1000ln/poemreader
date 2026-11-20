@@ -68,8 +68,11 @@ impl CompoundFile {
             .collect();
         let mut difat = difat_start;
         let per_sector = sector_size / 4;
+        // The header's DIFAT count is untrusted: a self-referencing chain with
+        // a huge count would otherwise loop billions of times.
+        let max_difat = difat_sectors.min(file.data.len() / sector_size + 1);
         let mut guard = 0usize;
-        while difat != NO_STREAM && difat != 0xFFFF_FFFE && guard <= difat_sectors {
+        while difat != NO_STREAM && difat != 0xFFFF_FFFE && guard <= max_difat {
             guard += 1;
             let Some(sector) = sector_of(&file.data, sector_size, difat) else {
                 break;
@@ -126,7 +129,7 @@ impl CompoundFile {
 
         // The root entry (type 5) holds the mini stream.
         if let Some(root) = file.entries.iter().find(|entry| entry.kind == 5) {
-            let size = root.size as usize;
+            let size = file.bounded_size(root.size);
             let start = root.start;
             file.mini_stream = file.chain(start, Some(size));
         }
@@ -141,6 +144,13 @@ impl CompoundFile {
         }
 
         Ok(file)
+    }
+
+    /// A stream cannot hold more bytes than the file that stores it. Malformed
+    /// directory entries claim sizes up to `u64::MAX`; clamping keeps
+    /// `Vec::with_capacity` from aborting the process.
+    fn bounded_size(&self, size: u64) -> usize {
+        (size as usize).min(self.data.len().saturating_add(self.sector_size))
     }
 
     /// The named stream, if the file has one.
@@ -159,7 +169,7 @@ impl CompoundFile {
     }
 
     fn read_entry(&self, entry: &Entry) -> Vec<u8> {
-        let size = entry.size as usize;
+        let size = self.bounded_size(entry.size);
         if entry.start == NO_STREAM || size == 0 {
             return Vec::new();
         }
@@ -172,7 +182,8 @@ impl CompoundFile {
 
     /// Reads a chain of ordinary sectors.
     fn chain(&self, start: u32, size: Option<usize>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(size.unwrap_or(0));
+        let capacity = size.unwrap_or(0).min(self.data.len());
+        let mut out = Vec::with_capacity(capacity);
         let mut sector = start;
         let mut guard = 0usize;
         while sector != NO_STREAM && sector != 0xFFFF_FFFE {
@@ -200,7 +211,7 @@ impl CompoundFile {
 
     /// Reads a chain of mini sectors out of the root entry.
     fn mini_chain(&self, start: u32, size: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(size);
+        let mut out = Vec::with_capacity(size.min(self.data.len()));
         let mut sector = start;
         let mut guard = 0usize;
         while sector != NO_STREAM && sector != 0xFFFF_FFFE {
@@ -238,6 +249,8 @@ fn sector_of(data: &[u8], sector_size: usize, index: u32) -> Option<&[u8]> {
 }
 
 fn read_u32(data: &[u8], offset: usize) -> u32 {
-    let bytes = data.get(offset..offset + 4).unwrap_or(&[0xFF; 4]);
+    let bytes = data
+        .get(offset..offset.saturating_add(4))
+        .unwrap_or(&[0xFF; 4]);
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }

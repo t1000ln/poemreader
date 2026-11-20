@@ -31,7 +31,14 @@ impl PdfLayout {
             .page_sizes()
             .iter()
             .map(|size| {
-                let ratio = (size.height / size.width).clamp(0.1, 10.0);
+                let raw = size.height / size.width;
+                // `Inf / Inf` is NaN and `f32::clamp` passes NaN through; a
+                // non-finite page height would poison every offset below.
+                let ratio = if raw.is_finite() {
+                    raw.clamp(0.1, 10.0)
+                } else {
+                    1.0
+                };
                 Size::new(page_width, page_width * ratio)
             })
             .collect::<Vec<_>>();

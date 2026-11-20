@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use gpui_kit::*;
 
-use crate::wrap::{wrap_line, CharWidths};
+use crate::wrap::{CharWidths, wrap_line};
 
 /// Space between two rows, in logical pixels.
 pub const LINE_GAP: f32 = 4.;
@@ -85,11 +85,7 @@ impl TextView {
         let chunks = split_points(&source, parallel_workers(source.len()));
         let finished: Vec<ChunkRows> = if chunks.len() == 2 {
             vec![wrap_chunk(
-                &source,
-                chunks[0],
-                chunks[1],
-                &widths,
-                wrap_width,
+                &source, chunks[0], chunks[1], &widths, wrap_width,
             )]
         } else {
             std::thread::scope(|scope| {
@@ -99,9 +95,7 @@ impl TextView {
                         let (start, end) = (pair[0], pair[1]);
                         let source = &source;
                         let widths = &widths;
-                        scope.spawn(move || {
-                            wrap_chunk(source, start, end, widths, wrap_width)
-                        })
+                        scope.spawn(move || wrap_chunk(source, start, end, widths, wrap_width))
                     })
                     .collect();
                 workers
@@ -284,6 +278,11 @@ fn split_points(text: &str, workers: usize) -> Vec<usize> {
     let target = text.len() / workers;
     let mut search = target;
     while points.len() < workers {
+        // A long line can push `search` well past the end of the text: there
+        // is no further newline to cut at, so slicing below would panic.
+        if search >= text.len() {
+            break;
+        }
         // The target may land inside a multi-byte character; slide forward to
         // the next char boundary before searching.
         while search < text.len() && !text.is_char_boundary(search) {
@@ -292,8 +291,13 @@ fn split_points(text: &str, workers: usize) -> Vec<usize> {
         match text[search..].find('\n') {
             Some(index) => {
                 let point = search + index + 1;
+                // A newline at the very end of the file would add the same
+                // point as the one appended below, leaving an empty chunk.
+                if point >= text.len() {
+                    break;
+                }
                 points.push(point);
-                search = point + target;
+                search = point.saturating_add(target);
             }
             None => break,
         }
@@ -347,12 +351,7 @@ fn wrap_chunk(
             }
         }
 
-        rows.push((
-            offset + row_start,
-            offset + line_text.len(),
-            !first,
-            line,
-        ));
+        rows.push((offset + row_start, offset + line_text.len(), !first, line));
         offset = line_break + 1;
     }
 
@@ -400,7 +399,7 @@ fn push_row(
 mod tests {
     // 显式导入：`gpui_kit::*` 里也有一张 `test` 属性宏，glob 进来会盖掉内置的
     // `#[test]`，测试模块编译不过。
-    use super::{CharWidths, merge_chunks, wrap_chunk};
+    use super::{CharWidths, merge_chunks, split_points, wrap_chunk};
     use std::collections::HashMap;
 
     /// Every row of a wrapped line reports that line's number, so the gutter
@@ -414,8 +413,11 @@ mod tests {
         }
         let widths = CharWidths::from_map(map);
         let text = "一二三四五六七\n八\n";
-        let (rows, _, lines) =
-            merge_chunks(vec![wrap_chunk(text, 0, text.len(), &widths, 30.)], 20., 12.);
+        let (rows, _, lines) = merge_chunks(
+            vec![wrap_chunk(text, 0, text.len(), &widths, 30.)],
+            20.,
+            12.,
+        );
 
         assert_eq!(lines, 2);
         assert!(rows.iter().any(|row| row.continuation));
@@ -446,14 +448,52 @@ mod tests {
         assert_eq!(numbers, vec![1, 2, 3, 4]);
     }
 
+    /// A large file with very few newlines used to push the split search past
+    /// the end of the text and panic on `text[search..]`.
+    #[test]
+    fn sparse_newlines_never_split_past_the_end() {
+        let mut text = "x".repeat(270_000);
+        text.push('\n');
+        text.push_str(&"y".repeat(30_000));
+        for workers in [2, 4, 8] {
+            let points = split_points(&text, workers);
+            assert_eq!(points.first(), Some(&0));
+            assert_eq!(points.last(), Some(&text.len()));
+            assert!(
+                points.windows(2).all(|pair| pair[0] < pair[1]),
+                "分块点必须严格递增: {points:?}"
+            );
+            for &point in &points {
+                assert!(text.is_char_boundary(point), "分块点必须落在字符边界");
+            }
+        }
+    }
+
+    /// Splitting multibyte text must still cut only at character boundaries.
+    #[test]
+    fn split_points_respect_utf8_boundaries() {
+        let text = "一".repeat(150_000) + "\n" + &"二".repeat(50_000);
+        for workers in [2, 4, 8] {
+            let points = split_points(&text, workers);
+            assert_eq!(points.first(), Some(&0));
+            assert_eq!(points.last(), Some(&text.len()));
+            for &point in &points {
+                assert!(text.is_char_boundary(point), "分块点必须落在字符边界");
+            }
+        }
+    }
+
     /// Blank lines keep their numbers and the lines after them keep counting,
     /// which is what an editor shows too.
     #[test]
     fn blank_lines_are_numbered_too() {
         let widths = CharWidths::empty();
         let text = "甲\n\n乙\n";
-        let (rows, _, lines) =
-            merge_chunks(vec![wrap_chunk(text, 0, text.len(), &widths, 600.)], 20., 12.);
+        let (rows, _, lines) = merge_chunks(
+            vec![wrap_chunk(text, 0, text.len(), &widths, 600.)],
+            20.,
+            12.,
+        );
 
         assert_eq!(lines, 3);
         let numbers: Vec<_> = rows.iter().map(|row| row.line).collect();

@@ -16,13 +16,12 @@ use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_QUALITY, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
-    DT_BOTTOM, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER,
-    DT_WORDBREAK, DeleteObject, DrawTextW, FillRect, GetStockObject,
+    DT_BOTTOM, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP,
+    DT_VCENTER, DT_WORDBREAK, DeleteObject, DrawTextW, FillRect, GetStockObject,
     GetTextExtentExPointW, GetTextExtentPoint32W, GetTextMetricsW, HALFTONE, HBRUSH, HDC, HFONT,
-    HGDIOBJ,
-    IntersectClipRect, OUT_DEFAULT_PRECIS, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, TEXTMETRICW, TRANSPARENT,
-    TextOutW,
+    HGDIOBJ, IntersectClipRect, OUT_DEFAULT_PRECIS, RestoreDC, SRCCOPY, SaveDC, SelectObject,
+    SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, TEXTMETRICW,
+    TRANSPARENT, TextOutW,
 };
 use windows::core::PCWSTR;
 
@@ -30,6 +29,7 @@ use crate::excel::{self, Workbook};
 use crate::print::{
     Device, ImagePrint, LayoutOutcome, PageMargins, PageRange, PrintFit, PrintSummary,
 };
+use crate::render::excel::grid_segments;
 use crate::word::{self, VAlign};
 
 thread_local! {
@@ -118,7 +118,9 @@ pub fn print_word(
     let bottom = height as f32 - (margin_bottom - hardware.1 as f32).max(0.0);
     // 页脚印在最下沿：给它让出两行，边距窄时最后一段正文不会压住页号。
     let bottom = if device.has_footer() {
-        bottom.min(height as f32 - dpi_y as f32 / 4.0).max(top + 72.0)
+        bottom
+            .min(height as f32 - dpi_y as f32 / 4.0)
+            .max(top + 72.0)
     } else {
         bottom
     };
@@ -138,7 +140,7 @@ pub fn print_word(
     for block in &document.blocks {
         let more = match block {
             word::Block::Paragraph(paragraph) => {
-                let layout = layout_paragraph(hdc, &mut fonts, paragraph, column_width, scale);
+                let layout = layout_paragraph(hdc, &mut fonts, paragraph, column_width, scale, 0.0);
                 draw_layout(
                     hdc,
                     &mut brushes,
@@ -313,16 +315,27 @@ pub fn print_image(
     let margin_y = margin_y.min(height as f32 / 2.0 - 1.0).max(0.0);
     let printable_width = width as f32 - 2.0 * margin_x;
     let printable_height = height as f32 - 2.0 * margin_y;
+    // 页脚印在可打印区域的最下沿：给它让出两行，画面不会压住页号。和文本、
+    // 表格一样，计数趟也必须留同样的高度，总页数才对得上。
+    let printable_height = if device.has_footer() {
+        (printable_height - dpi_y as f32 / 4.0).max(72.0)
+    } else {
+        printable_height
+    };
     if printable_width < 72.0 || printable_height < 72.0 {
         return Err(String::from("打印机没有足够的可打印区域"));
     }
 
     if pixels.width() == 0 || pixels.height() == 0 {
-        blank_page(device, 0)?;
-        return Ok(LayoutOutcome::whole(PrintSummary {
-            printed: 1,
-            total: 1,
-        }));
+        // 没有画面可印：只有用户确实选中了这一页时才产出一张空纸，别在
+        // 「只印第 5 页」这种请求里凭空多打一页。
+        let printed = if range.includes(0) {
+            blank_page(device, 0)?;
+            1
+        } else {
+            0
+        };
+        return Ok(LayoutOutcome::whole(PrintSummary { printed, total: 1 }));
     }
 
     let layout = crate::print::image_layout(
@@ -694,10 +707,7 @@ fn fit_prefix(hdc: HDC, text: &[u16], max_width: f32) -> usize {
 // ---------------------------------------------------------------- Word layout
 
 enum Item {
-    Line {
-        line: Line,
-        indent: f32,
-    },
+    Line { line: Line, indent: f32 },
 }
 
 /// One laid-out line: text runs and inline pictures sharing a baseline. The
@@ -771,6 +781,7 @@ fn layout_paragraph(
     paragraph: &word::Paragraph,
     width: f32,
     scale: f32,
+    hang: f32,
 ) -> ParagraphLayout {
     let line_height =
         (paragraph.draw_size() * 1.3 * paragraph.line_spacing.max(0.8) * scale).max(1.0);
@@ -787,6 +798,7 @@ fn layout_paragraph(
         rest_width,
         limit: first_width,
         content_width: width.max(24.0),
+        hang,
         first_line: true,
         first_indent,
         line_height,
@@ -901,6 +913,11 @@ struct Flow<'a> {
     limit: f32,
     /// Width of the whole text column, which a picture may never exceed.
     content_width: f32,
+    /// How far the last character of a line may hang past the limit. Word
+    /// keeps a character on the line while its *start* is still inside the
+    /// column, so the printed page breaks where the screen does; the hang is
+    /// capped at a table cell's padding so no glyph is drawn over a border.
+    hang: f32,
     first_line: bool,
     first_indent: f32,
     /// The paragraph's text line height; a line without pictures is this tall.
@@ -966,7 +983,7 @@ impl Flow<'_> {
             let mut start = 0;
             while start < utf16.len() {
                 let remaining = self.limit - self.line.width;
-                let mut fit = fit_prefix(self.hdc, &utf16[start..], remaining);
+                let mut fit = fit_prefix(self.hdc, &utf16[start..], remaining + self.hang);
                 if fit == 0 {
                     if self.line.parts.is_empty() {
                         // A single glyph wider than the line still gets placed.
@@ -1011,7 +1028,7 @@ impl Flow<'_> {
         }
         // Word draws an inline picture on the text line; one that does not fit
         // any more starts the next line, like a wrapped word would.
-        if !self.line.parts.is_empty() && self.line.width + width > self.limit {
+        if !self.line.parts.is_empty() && self.line.width + width > self.limit + self.hang {
             self.flush();
         }
         self.line.parts.push(LinePart::Image {
@@ -1053,7 +1070,9 @@ fn draw_layout(
                 } else {
                     layout.line_height
                 };
-                if let Some(pages) = pages.as_deref_mut() && !pages.ensure(y, line_height)? {
+                if let Some(pages) = pages.as_deref_mut()
+                    && !pages.ensure(y, line_height)?
+                {
                     return Ok(false);
                 }
                 let offset = alignment_offset(layout.align, content_width, line.width);
@@ -1254,6 +1273,7 @@ fn draw_table(
                         paragraph,
                         (width - 2.0 * padding).max(24.0),
                         scale,
+                        padding,
                     ));
                 }
             }
@@ -1534,19 +1554,10 @@ fn draw_sheet_page(
     let y_offset = sheet.row_tops[row_start];
     let row_count = sheet.row_count();
     let column_count = sheet.column_count();
-    let padding = (3.0 * scale).max(1.0);
+    let padding = (4.0 * scale).max(1.0);
 
     draw_grid(
-        hdc,
-        brushes,
-        sheet,
-        origin_x,
-        origin_y,
-        scale,
-        x_offset,
-        y_offset,
-        rows,
-        columns,
+        hdc, brushes, sheet, origin_x, origin_y, scale, x_offset, y_offset, rows, columns,
     );
 
     let first = sheet
@@ -1684,14 +1695,39 @@ fn draw_grid(
     let bottom = origin_y + (sheet.row_tops[row_end] - y_offset) * scale;
 
     // The closing edges are drawn as well, so a table whose last row or column
-    // has no cells of its own still ends in a line.
+    // has no cells of its own still ends in a line. A merged range keeps its
+    // outer edges but no line runs through it, exactly as on screen.
     for row in row_start..=row_end {
         let y = origin_y + (sheet.row_tops[row] - y_offset) * scale;
-        fill_rect(hdc, brushes, left, y, right - left, thickness, GRID_COLOR);
+        let holes = sheet
+            .row_grid_holes(row)
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    origin_x + (sheet.column_lefts[start] - x_offset) * scale,
+                    origin_x + (sheet.column_lefts[end] - x_offset) * scale,
+                )
+            })
+            .collect();
+        for (start, end) in grid_segments(left, right, holes) {
+            fill_rect(hdc, brushes, start, y, end - start, thickness, GRID_COLOR);
+        }
     }
     for column in column_start..=column_end {
         let x = origin_x + (sheet.column_lefts[column] - x_offset) * scale;
-        fill_rect(hdc, brushes, x, top, thickness, bottom - top, GRID_COLOR);
+        let holes = sheet
+            .column_grid_holes(column)
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    origin_y + (sheet.row_tops[start] - y_offset) * scale,
+                    origin_y + (sheet.row_tops[end] - y_offset) * scale,
+                )
+            })
+            .collect();
+        for (start, end) in grid_segments(top, bottom, holes) {
+            fill_rect(hdc, brushes, x, start, thickness, end - start, GRID_COLOR);
+        }
     }
 }
 
@@ -1730,7 +1766,10 @@ fn draw_cell_text(
         );
     }
 
-    let wrap = style.is_some_and(|style| style.wrap);
+    // The sheet decided the wrapping when it sized the row, so a cell that is
+    // wider than its column is already marked for it. Trusting only the style
+    // here would print the old single-line, half-cut cell.
+    let wrap = cell.wrap;
     let align = style
         .map(|style| style.horizontal(cell.numeric))
         .unwrap_or_default();
@@ -1743,7 +1782,7 @@ fn draw_cell_text(
         excel::HorizontalAlign::Left => DT_LEFT.0,
     };
     if wrap {
-        flags |= DT_WORDBREAK.0 | DT_TOP.0;
+        flags |= DT_WORDBREAK.0;
     } else {
         flags |= DT_SINGLELINE.0
             | match valign {
@@ -1753,17 +1792,66 @@ fn draw_cell_text(
             };
     }
 
-    let mut rect = RECT {
-        left: (left + padding).round() as i32,
-        top: (top + padding * 0.5).round() as i32,
-        right: (left + width - padding).round() as i32,
-        bottom: (top + height - padding * 0.5).round() as i32,
-    };
-    if rect.right <= rect.left || rect.bottom <= rect.top {
+    let rect_left = (left + padding).round() as i32;
+    let rect_right = (left + width - padding).round() as i32;
+    let inner_top = (top + padding * 0.5).round() as i32;
+    let inner_bottom = (top + height - padding * 0.5).round() as i32;
+    if rect_right <= rect_left || inner_bottom <= inner_top {
         return;
     }
 
-    let mut text: Vec<u16> = cell.text.encode_utf16().collect();
+    // `DrawText` breaks on CRLF; a lone LF is reliable only once it is paired.
+    let source = if wrap {
+        cell.text.replace('\n', "\r\n")
+    } else {
+        cell.text.clone()
+    };
+    let mut text: Vec<u16> = source.encode_utf16().collect();
+
+    if wrap {
+        // `DT_VCENTER` only means anything to a single line. Wrapped text was
+        // therefore always pinned to the top of its cell, and a merged cell —
+        // a pickup point centred across the four rows it spans — printed its
+        // text on the first of them. The block is measured first so it can be
+        // placed the way the cell asks.
+        let mut measure = RECT {
+            left: rect_left,
+            top: 0,
+            right: rect_right,
+            bottom: 0,
+        };
+        let _ = unsafe {
+            DrawTextW(
+                hdc,
+                &mut text,
+                &mut measure,
+                DRAW_TEXT_FORMAT(flags | DT_CALCRECT.0),
+            )
+        };
+        let block = (measure.bottom - measure.top).max(1);
+        let free = (inner_bottom - inner_top - block).max(0);
+        let offset = match valign {
+            excel::VerticalAlign::Center => free / 2,
+            excel::VerticalAlign::Bottom => free,
+            excel::VerticalAlign::Top => 0,
+        };
+        let block_top = inner_top + offset;
+        let mut rect = RECT {
+            left: rect_left,
+            top: block_top,
+            right: rect_right,
+            bottom: block_top + block,
+        };
+        let _ = unsafe { DrawTextW(hdc, &mut text, &mut rect, DRAW_TEXT_FORMAT(flags)) };
+        return;
+    }
+
+    let mut rect = RECT {
+        left: rect_left,
+        top: inner_top,
+        right: rect_right,
+        bottom: inner_bottom,
+    };
     let _ = unsafe { DrawTextW(hdc, &mut text, &mut rect, DRAW_TEXT_FORMAT(flags)) };
 }
 
@@ -1856,9 +1944,8 @@ impl Dib {
         let mut data = Vec::with_capacity(image.as_raw().len());
         for pixel in image.as_raw().as_chunks::<4>().0 {
             let alpha = pixel[3] as u32;
-            let over_white = |channel: u8| {
-                ((channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8
-            };
+            let over_white =
+                |channel: u8| ((channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
             data.extend_from_slice(&[
                 over_white(pixel[2]),
                 over_white(pixel[1]),
@@ -1972,6 +2059,7 @@ mod tests {
                 text: text.to_string(),
                 style,
                 numeric: false,
+                wrap: false,
             };
             match rows.last_mut() {
                 Some(entry) if entry.index == row => entry.cells.push(cell),
@@ -2028,8 +2116,16 @@ mod tests {
         let page = sheet_page(&sheet, &styles);
 
         // Texture order: blue first, so red reads back as [0, 0, 255, 255].
-        assert_eq!(page.get_pixel(5, 5).0, [0, 0, 255, 255], "the fill is painted");
-        assert_eq!(page.get_pixel(30, 5).0, [255, 255, 255, 255], "its neighbour is not");
+        assert_eq!(
+            page.get_pixel(5, 5).0,
+            [0, 0, 255, 255],
+            "the fill is painted"
+        );
+        assert_eq!(
+            page.get_pixel(30, 5).0,
+            [255, 255, 255, 255],
+            "its neighbour is not"
+        );
     }
 
     #[test]
@@ -2039,10 +2135,109 @@ mod tests {
         let page = sheet_page(&sheet, &styles);
 
         let grid = [0xD9u8, 0xD9, 0xD9, 255];
-        assert_eq!(page.get_pixel(30, 30).0, [255, 255, 255, 255], "cells stay white");
-        assert_eq!(page.get_pixel(30, 20).0, grid, "the row line runs to the right edge");
-        assert_eq!(page.get_pixel(20, 30).0, grid, "the column line runs down the page");
+        assert_eq!(
+            page.get_pixel(30, 30).0,
+            [255, 255, 255, 255],
+            "cells stay white"
+        );
+        assert_eq!(
+            page.get_pixel(30, 20).0,
+            grid,
+            "the row line runs to the right edge"
+        );
+        assert_eq!(
+            page.get_pixel(20, 30).0,
+            grid,
+            "the column line runs down the page"
+        );
         assert_eq!(page.get_pixel(30, 0).0, grid, "the top edge is ruled");
+    }
+
+    /// Excel rules no line between the cells it joined, so the printed page
+    /// must not draw one through a merged range either.
+    #[test]
+    fn a_merge_prints_without_a_grid_line_through_it() {
+        let styles = vec![excel::CellStyle::default()];
+        let mut sheet = sheet(vec![(0, 1, 0, "合并")]);
+        sheet.merges = vec![excel::Merge {
+            row: 0,
+            column: 1,
+            rows: 2,
+            columns: 1,
+        }];
+        let page = sheet_page(&sheet, &styles);
+
+        let grid = [0xD9u8, 0xD9, 0xD9, 255];
+        assert_eq!(page.get_pixel(10, 20).0, grid, "别的列照旧画横线");
+        assert_eq!(
+            page.get_pixel(30, 20).0,
+            [255, 255, 255, 255],
+            "合并单元格中间没有横线"
+        );
+    }
+
+    /// 折行的文字也要按单元格的垂直对齐落位。`DT_VCENTER` 只对单行有效，
+    /// 折行文本曾经一律顶着格子上沿画，合并了四行的接送点因此看上去贴在
+    /// 第一行，而不是整块中间。
+    #[test]
+    fn wrapped_text_is_centred_in_the_rows_a_merge_spans() {
+        let styles = vec![excel::CellStyle {
+            valign: excel::VerticalAlign::Center,
+            align: Some(excel::HorizontalAlign::Center),
+            ..Default::default()
+        }];
+        let sheet = excel::Sheet {
+            name: String::from("合并"),
+            column_lefts: vec![0.0, 100.0],
+            row_tops: vec![0.0, 20.0, 40.0, 60.0, 80.0],
+            rows: vec![excel::SheetRow {
+                index: 0,
+                cells: vec![excel::Cell {
+                    column: 0,
+                    text: String::from("甲\n乙"),
+                    style: 0,
+                    numeric: false,
+                    wrap: true,
+                }],
+            }],
+            merges: vec![excel::Merge {
+                row: 0,
+                column: 0,
+                rows: 4,
+                columns: 1,
+            }],
+        };
+
+        let mut device = Device::sheet(SheetGeometry::without_margins(100, 80)).expect("sheet");
+        let hdc = device.hdc();
+        device.start_page(0).expect("start");
+        let mut fonts = Fonts::new(hdc, 96.0);
+        let mut brushes = Brushes::default();
+        draw_sheet_page(
+            hdc,
+            &mut fonts,
+            &mut brushes,
+            &sheet,
+            &styles,
+            0.0,
+            0.0,
+            1.0,
+            (0, 4),
+            (0, 1),
+        );
+        device.end_page(0).expect("end");
+        let page = device.into_pages().into_iter().next().expect("一页").1;
+
+        // 网格线是浅灰的，只认深色的文字。
+        let ink = |y: u32| (2..98).any(|x| page.get_pixel(x, y).0[0] < 128);
+        let top = (0..80).find(|y| ink(*y)).expect("画了文字");
+        let bottom = (0..80).rev().find(|y| ink(*y)).expect("画了文字");
+        let centre = (top + bottom) / 2;
+        assert!(
+            (32..=48).contains(&centre),
+            "文字要落在合并区中间，实际 {top}..{bottom}"
+        );
+        assert!(top > 12, "不该贴着格子上沿，实际从 {top} 开始");
     }
 
     /// Print a picture on a 300 × 300 sheet and read the pages back. At 96 dpi
@@ -2119,7 +2314,11 @@ mod tests {
         let page = print_picture(&red_square(), ImageScale::ALL[1]);
 
         assert_eq!(page.get_pixel(150, 150).0, RED, "the middle is painted");
-        assert_eq!(page.get_pixel(60, 150).0, PAPER, "half size leaves a border");
+        assert_eq!(
+            page.get_pixel(60, 150).0,
+            PAPER,
+            "half size leaves a border"
+        );
     }
 
     #[test]
@@ -2160,8 +2359,16 @@ mod tests {
             })
         };
 
-        assert_eq!(at(0.0).get_pixel(150, 150).0, RED, "the left edge shows the left half");
-        assert_eq!(at(1.0).get_pixel(150, 150).0, BLUE, "the right edge shows the right half");
+        assert_eq!(
+            at(0.0).get_pixel(150, 150).0,
+            RED,
+            "the left edge shows the left half"
+        );
+        assert_eq!(
+            at(1.0).get_pixel(150, 150).0,
+            BLUE,
+            "the right edge shows the right half"
+        );
         // 居中时接缝正好落在纸的中间，往左一点还是红的左半，往右一点是右半。
         let centered = at(0.5);
         assert_eq!(centered.get_pixel(100, 150).0, RED, "左半边");
@@ -2234,8 +2441,14 @@ mod tests {
         )
         .expect("print");
 
-        assert_eq!(outcome.summary.total, 9, "the job still knows how many pages it has");
-        assert_eq!(outcome.summary.printed, 1, "but only the page that was asked for is painted");
+        assert_eq!(
+            outcome.summary.total, 9,
+            "the job still knows how many pages it has"
+        );
+        assert_eq!(
+            outcome.summary.printed, 1,
+            "but only the page that was asked for is painted"
+        );
         assert_eq!(device.into_pages().len(), 1);
     }
 }

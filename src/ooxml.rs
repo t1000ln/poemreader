@@ -9,8 +9,8 @@ use std::io::Read as _;
 
 use flate2::read::DeflateDecoder;
 use quick_xml::Reader;
-use quick_xml::escape::unescape;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::escape::{resolve_predefined_entity, unescape};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 
 /// Resolved content of an `.docx` or `.xlsx` package.
 pub struct Package {
@@ -226,6 +226,11 @@ pub fn parse_tree(xml: &str) -> Result<Node, String> {
                     node.text.push_str(&text_of(&event));
                 }
             }
+            Ok(Event::GeneralRef(event)) => {
+                if let (Some(node), Some(text)) = (stack.last_mut(), text_of_ref(&event)) {
+                    node.text.push_str(&text);
+                }
+            }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
@@ -262,6 +267,21 @@ fn node_of(event: &BytesStart<'_>) -> Node {
         text: String::new(),
         children: Vec::new(),
     }
+}
+
+/// The text a general reference stands for: a numeric character reference such
+/// as `&#10;`, or one of XML's predefined entities (`&amp;` and friends).
+///
+/// quick-xml reports these as their own [`Event::GeneralRef`] instead of folding
+/// them into the surrounding [`Event::Text`], so a parser that only reads text
+/// events loses them — which is how the line break Excel writes for Alt+Enter
+/// used to disappear from a cell.
+pub fn text_of_ref(event: &BytesRef<'_>) -> Option<String> {
+    if let Ok(Some(character)) = event.resolve_char_ref() {
+        return Some(character.to_string());
+    }
+    let name = String::from_utf8_lossy(event.as_ref());
+    resolve_predefined_entity(&name).map(str::to_string)
 }
 
 /// Text of a text event, with XML entities resolved.

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::print::{ImagePrint, Orientation, PageMargins, PagesPerSheet, PrintFit};
+use crate::print::{ImagePrint, ImageScale, Orientation, PageMargins, PagesPerSheet, PrintFit};
 
 /// Reading colour scheme, persisted by name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,11 @@ impl PrintParams {
     /// 读回的参数夹回合法范围：拖动基准点万一存出界，印的时候也回得来。
     pub fn sanitized(&mut self) {
         self.image.anchor = self.image.anchor.clamped();
+        // 0% 会让图片彻底消失，超大值会把版面算爆。界面给不出这种值，只有
+        // 手改过或旧版本的 settings.json 会有。
+        if self.image.scale.0 == 0 || self.image.scale.0 > ImageScale::MAX_PERCENT {
+            self.image.scale = ImageScale::default();
+        }
     }
 }
 
@@ -113,7 +118,12 @@ impl Default for Settings {
 
 impl Settings {
     pub fn font_size(&self) -> f32 {
-        self.font_size.clamp(8.0, 72.0)
+        // `f32::clamp` passes NaN through, which would reach the text layout.
+        if self.font_size.is_finite() {
+            self.font_size.clamp(8.0, 72.0)
+        } else {
+            Self::default().font_size
+        }
     }
 
     pub fn pdf_zoom(&self) -> f32 {
@@ -179,7 +189,17 @@ impl Store {
         }
 
         if let Ok(text) = serde_json::to_string_pretty(&self.settings) {
-            let _ = std::fs::write(path, text);
+            // 先写旁边再改名：写到一半进程退出不会留下半截 JSON，把全部偏好
+            // 一起弄丢。不能覆盖目标文件的文件系统再退回原地写。
+            let mut temp = path.clone();
+            temp.set_extension("json.tmp");
+            if std::fs::write(&temp, &text).is_err() {
+                return;
+            }
+            if std::fs::rename(&temp, path).is_err() {
+                let _ = std::fs::remove_file(&temp);
+                let _ = std::fs::write(path, text);
+            }
         }
     }
 }
@@ -257,5 +277,27 @@ mod tests {
         params.image.anchor = ImageAnchor { x: 3.0, y: -0.5 };
         params.sanitized();
         assert_eq!(params.image.anchor, ImageAnchor { x: 1.0, y: 0.0 });
+    }
+
+    #[test]
+    fn an_absurd_image_scale_is_sanitized_on_load() {
+        let mut params = PrintParams::default();
+        for scale in [0, u32::MAX] {
+            params.image.scale = ImageScale(scale);
+            params.sanitized();
+            assert_eq!(params.image.scale, ImageScale(100));
+        }
+        params.image.scale = ImageScale(200);
+        params.sanitized();
+        assert_eq!(params.image.scale, ImageScale(200), "合法值要原样保留");
+    }
+
+    #[test]
+    fn a_non_finite_font_size_falls_back_to_the_default() {
+        let mut settings = Settings::default();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            settings.font_size = value;
+            assert_eq!(settings.font_size(), Settings::default().font_size());
+        }
     }
 }

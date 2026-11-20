@@ -132,10 +132,10 @@ pub(crate) fn run() {
         .expect("failed to open the PoemReader window");
 
         // Ask the default printer for its paper now, so the first preview has
-        // the page size ready instead of waiting on the driver.
-        cx.background_executor()
-            .spawn(async { crate::preview::warm_paper() })
-            .detach();
+        // the page size ready instead of waiting on the driver. Some drivers
+        // take seconds to answer; keeping this off the shared background
+        // executor stops a slow printer from making file loads queue behind it.
+        std::thread::spawn(crate::preview::warm_paper);
 
         // Closing the window with its close button removes it without running
         // the app-quit handlers, so persist the latest reading position here
@@ -145,6 +145,14 @@ pub(crate) fn run() {
         let close_position = latest_position.clone();
         let reader_id = reader.0.window_id();
         let subscription = cx.on_window_closed(move |cx, window_id| {
+            // Only the reader's own closing saves the reading position. A
+            // preview window is closed on every file switch; saving there would
+            // write the *old* document's position under the *new* last_file,
+            // and would also put a synchronous disk write in the switch path.
+            if window_id != reader_id {
+                return;
+            }
+
             let mut store = close_store.borrow_mut();
             if let Some(position) = close_position.get()
                 && let Some(path) = store.settings().last_file.clone()
@@ -156,12 +164,10 @@ pub(crate) fn run() {
 
             // The preview is a companion window: once the reader is gone it has
             // nothing left to show, and the application can shut down.
-            if window_id == reader_id {
-                for handle in cx.windows() {
-                    handle
-                        .update(cx, |_, window, _| window.remove_window())
-                        .ok();
-                }
+            for handle in cx.windows() {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
             }
         });
         std::mem::forget(subscription);

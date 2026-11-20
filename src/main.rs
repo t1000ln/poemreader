@@ -118,6 +118,9 @@ const REWRAP_DEBOUNCE: Duration = Duration::from_millis(120);
 /// How long scrolling must stay idle before the position is written to disk.
 const SAVE_POSITION_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Poll interval while the loading thread is still reading a file.
+const LOAD_POLL: Duration = Duration::from_millis(16);
+
 /// The app icon, also embedded in the executable by `build.rs`.
 pub(crate) const APP_ICON: &[u8] = include_bytes!("../assets/icon.svg");
 
@@ -1193,22 +1196,42 @@ impl PoemReader {
         window.set_window_title(&format!("PoemReader — 正在打开 {name}…"));
         cx.notify();
 
+        // The shared background executor also runs printer-driver queries and
+        // preview page rasterising; either can occupy it for seconds. A file
+        // switch must never queue behind them, so the load gets its own thread
+        // and the view only polls for the result (the same arrangement the
+        // preview uses to count pages).
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (kind, loaded) = load_document(&read_path)?;
+                let content = build_content(
+                    loaded,
+                    &font,
+                    font_size,
+                    line_height,
+                    available_width,
+                    line_numbers,
+                    &text_system,
+                );
+                Ok::<_, String>((kind, content))
+            }))
+            .unwrap_or_else(|_| Err(String::from("读取文件时发生意外错误")));
+            let _ = sender.send(loaded);
+        });
+
         self.load_task = Some(cx.spawn_in(window, async move |view, cx| {
-            let loaded = cx
-                .background_spawn(async move {
-                    let (kind, loaded) = load_document(&read_path)?;
-                    let content = build_content(
-                        loaded,
-                        &font,
-                        font_size,
-                        line_height,
-                        available_width,
-                        line_numbers,
-                        &text_system,
-                    );
-                    Ok::<_, String>((kind, content))
-                })
-                .await;
+            let loaded = loop {
+                match receiver.try_recv() {
+                    Ok(loaded) => break loaded,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor().timer(LOAD_POLL).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break Err(String::from("读取文件时发生意外错误"));
+                    }
+                }
+            };
 
             match loaded {
                 Ok((kind, content)) => {

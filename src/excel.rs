@@ -21,6 +21,24 @@ const DEFAULT_COLUMN_WIDTH: f32 = 8.43;
 const DEFAULT_ROW_HEIGHT: f32 = 15.0;
 /// Horizontal space a cell spends on padding and borders.
 const CELL_INSET: f32 = 8.0;
+/// Extra room a column keeps when it is widened for the value in it, so the
+/// text does not end up flush against the border.
+const CELL_CLEARANCE: f32 = 4.0;
+/// Vertical padding above and below the text of a cell, in pixels.
+const CELL_VPAD: f32 = 2.0;
+/// Height of one line of cell text relative to the font size. The renderer
+/// draws at 1.25; the extra tenth is slack so a wrapped row is never a line
+/// short and clips its last line.
+const LINE_HEIGHT_FACTOR: f32 = 1.35;
+/// A hopeless cell — one long run of text in a very narrow column — would
+/// otherwise ask for tens of thousands of rows. The cap keeps a malformed
+/// worksheet from exploding the layout; real cells never come close.
+const MAX_WRAP_LINES: usize = 500;
+/// Excel's own limits. A malformed worksheet may claim a cell reference far
+/// beyond them; clamping keeps `row_tops`/`column_lefts` from allocating
+/// gigabytes (or looping billions of times) for a few bytes of XML.
+const MAX_SHEET_ROWS: u32 = 1_048_576;
+const MAX_SHEET_COLUMNS: u32 = 16_384;
 
 pub struct Workbook {
     pub sheets: Vec<Sheet>,
@@ -53,6 +71,11 @@ pub struct Cell {
     pub style: usize,
     /// True for numbers, which Excel aligns to the right by default.
     pub numeric: bool,
+    /// Whether the text is drawn on several lines. A cell wraps when its style
+    /// asks for it, when the text carries a line break, or when one line would
+    /// be wider than the cell — the reader shows the whole cell rather than
+    /// cutting the overflow off.
+    pub wrap: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,10 +136,44 @@ impl Sheet {
         self.merges.iter().any(|merge| {
             (merge.row, merge.column) != (row, column)
                 && row >= merge.row
-                && row < merge.row + merge.rows
+                && row < merge.row.saturating_add(merge.rows)
                 && column >= merge.column
-                && column < merge.column + merge.columns
+                && column < merge.column.saturating_add(merge.columns)
         })
+    }
+
+    /// The columns a merge hides at the boundary above `row`, as half-open
+    /// `(first, end)` ranges. Excel draws no grid inside a merged range, so the
+    /// horizontal line at that boundary has to be broken there.
+    pub fn row_grid_holes(&self, row: usize) -> Vec<(usize, usize)> {
+        let row = row as u32;
+        let columns = self.column_count();
+        self.merges
+            .iter()
+            .filter(|merge| merge.row < row && row < merge.row.saturating_add(merge.rows))
+            .filter_map(|merge| {
+                let start = (merge.column as usize).min(columns);
+                let end = start.saturating_add(merge.columns as usize).min(columns);
+                (end > start).then_some((start, end))
+            })
+            .collect()
+    }
+
+    /// The rows a merge hides at the boundary left of `column`.
+    pub fn column_grid_holes(&self, column: usize) -> Vec<(usize, usize)> {
+        let column = column as u32;
+        let rows = self.row_count();
+        self.merges
+            .iter()
+            .filter(|merge| {
+                merge.column < column && column < merge.column.saturating_add(merge.columns)
+            })
+            .filter_map(|merge| {
+                let start = (merge.row as usize).min(rows);
+                let end = start.saturating_add(merge.rows as usize).min(rows);
+                (end > start).then_some((start, end))
+            })
+            .collect()
     }
 }
 
@@ -240,6 +297,7 @@ pub(crate) fn legacy_sheet(sheet: LegacySheet, styles: &[CellStyle]) -> Sheet {
                     style: cell.style,
                     text: cell.text,
                     numeric: cell.numeric,
+                    wrap: false,
                 })
                 .collect(),
             merges: sheet.merges,
@@ -320,6 +378,8 @@ struct RawCell {
     style: usize,
     text: String,
     numeric: bool,
+    /// Filled in by [`finish_sheet`] once the column widths are known.
+    wrap: bool,
 }
 
 struct SheetData {
@@ -426,6 +486,15 @@ fn parse_sheet(
                     builder.raw.push_str(&text_of(&event));
                 }
             }
+            Ok(Event::GeneralRef(event)) => {
+                if phonetic_depth == 0
+                    && let Some(builder) = cell.as_mut()
+                    && (in_value || builder.kind == CellKind::Inline)
+                    && let Some(text) = ooxml::text_of_ref(&event)
+                {
+                    builder.raw.push_str(&text);
+                }
+            }
             Ok(Event::End(event)) => match end_name(&event) {
                 b"c" => {
                     if let Some(builder) = cell.take() {
@@ -454,10 +523,14 @@ fn cell_builder(
     row_index: &mut u32,
     next_column: &mut u32,
 ) -> CellBuilder {
+    // `cell_reference` returns (row, column); the fallback for a missing or
+    // invalid `r` must use that same order, or the sheet is transposed.
     let (row, column) = match attr(event, "r") {
-        Some(reference) => cell_reference(&reference).unwrap_or((*next_column, *row_index)),
-        None => (*next_column, *row_index),
+        Some(reference) => cell_reference(&reference).unwrap_or((*row_index, *next_column)),
+        None => (*row_index, *next_column),
     };
+    let row = row.min(MAX_SHEET_ROWS - 1);
+    let column = column.min(MAX_SHEET_COLUMNS - 1);
     *next_column = column.saturating_add(1);
     *row_index = row;
     let style = attr(event, "s")
@@ -501,10 +574,13 @@ fn push_cell(data: &mut SheetData, builder: CellBuilder, text: String, styles: &
             style: builder.style,
             text,
             numeric: builder.kind == CellKind::Number,
+            wrap: false,
         });
     }
-    data.max_row = data.max_row.max(builder.row);
-    data.max_column = data.max_column.max(builder.column);
+    data.max_row = data.max_row.max(builder.row.min(MAX_SHEET_ROWS - 1));
+    data.max_column = data
+        .max_column
+        .max(builder.column.min(MAX_SHEET_COLUMNS - 1));
 }
 
 /// The display text of a cell, from its stored value and type.
@@ -549,7 +625,8 @@ fn row_of(event: &quick_xml::events::BytesStart<'_>, data: &mut SheetData, fallb
     let index = attr(event, "r")
         .and_then(|value| value.parse::<u32>().ok())
         .map(|value| value.saturating_sub(1))
-        .unwrap_or(fallback);
+        .unwrap_or(fallback)
+        .min(MAX_SHEET_ROWS - 1);
     if let Some(height) = attr_f32(event, "ht") {
         data.row_heights
             .insert(index, (height * 4.0 / 3.0).max(6.0));
@@ -561,11 +638,13 @@ fn read_columns(event: &quick_xml::events::BytesStart<'_>, data: &mut SheetData)
     let min = attr(event, "min")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(1)
-        .saturating_sub(1);
+        .saturating_sub(1)
+        .min(MAX_SHEET_COLUMNS - 1);
     let max = attr(event, "max")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(min + 1)
-        .saturating_sub(1);
+        .saturating_sub(1)
+        .min(MAX_SHEET_COLUMNS - 1);
     let width = attr_f32(event, "width").unwrap_or(DEFAULT_COLUMN_WIDTH);
     let pixels = (width * 7.0 + 5.0).max(8.0);
     for index in min..=max.min(min.saturating_add(1024)) {
@@ -592,63 +671,162 @@ fn read_sheet_format(event: &quick_xml::events::BytesStart<'_>, data: &mut Sheet
 
 fn finish_sheet(mut data: SheetData, styles: &[CellStyle]) -> Sheet {
     for merge in &data.merges {
-        data.max_row = data.max_row.max(merge.row + merge.rows - 1);
-        data.max_column = data.max_column.max(merge.column + merge.columns - 1);
+        data.max_row = data.max_row.max(
+            merge
+                .row
+                .saturating_add(merge.rows)
+                .saturating_sub(1)
+                .min(MAX_SHEET_ROWS - 1),
+        );
+        data.max_column = data.max_column.max(
+            merge
+                .column
+                .saturating_add(merge.columns)
+                .saturating_sub(1)
+                .min(MAX_SHEET_COLUMNS - 1),
+        );
     }
     for row in data.row_heights.keys().copied().collect::<Vec<_>>() {
-        data.max_row = data.max_row.max(row);
+        data.max_row = data.max_row.max(row.min(MAX_SHEET_ROWS - 1));
     }
     for column in data.column_widths.keys().copied().collect::<Vec<_>>() {
-        data.max_column = data.max_column.max(column);
+        data.max_column = data.max_column.max(column.min(MAX_SHEET_COLUMNS - 1));
     }
 
-    let rows = data.max_row as usize + 1;
-    let columns = data.max_column as usize + 1;
+    let rows = data.max_row.min(MAX_SHEET_ROWS - 1) as usize + 1;
+    let columns = data.max_column.min(MAX_SHEET_COLUMNS - 1) as usize + 1;
 
-    // Wrapped text needs more room than Excel's default row height, so rows
-    // without a height of their own are grown to fit the estimated line count.
+    // The column edges come first: a cell's column width is what decides where
+    // its text has to wrap, and wrapping is what keeps the text from being cut
+    // off at the cell border.
+    //
+    // A column that is only a little too narrow for a single-line value gets
+    // wider instead of breaking that value in two: a phone number split as
+    // `187295750` / `26` is complete but unreadable. Anything much longer than
+    // the column wraps, so a long address cannot stretch the sheet sideways.
+    let mut widths = (0..columns)
+        .map(|column| {
+            data.column_widths
+                .get(&(column as u32))
+                .copied()
+                .unwrap_or(data.default_column_width)
+                .max(8.0)
+        })
+        .collect::<Vec<_>>();
+
     for cell in &data.cells {
+        if cell.text.is_empty() || cell.text.contains('\n') {
+            continue;
+        }
         let Some(style) = styles.get(cell.style) else {
             continue;
         };
-        if !style.wrap || data.row_heights.contains_key(&cell.row) {
+        // Text the sheet already wraps, and text spanning several columns,
+        // are handled by wrapping; a merge would have to share any extra
+        // width between the columns it covers.
+        if style.wrap || merged_span(&data.merges, cell.row, cell.column) != (1, 1) {
             continue;
         }
-        let width = data
-            .column_widths
-            .get(&cell.column)
-            .copied()
-            .unwrap_or(data.default_column_width)
-            - CELL_INSET;
-        let lines = estimated_lines(&cell.text, style.size, width.max(8.0));
-        let height = (lines as f32 * style.size * 1.35).max(data.default_row_height);
-        let entry = data.row_heights.entry(cell.row).or_insert(height);
-        *entry = entry.max(height);
+        // Chinese text can break between any two characters, so wrapping it
+        // costs nothing; a short ASCII run (a phone number, a code) has no
+        // break point and reads badly when cut in two.
+        if !is_unbreakable(&cell.text) {
+            continue;
+        }
+        let column = (cell.column as usize).min(columns - 1);
+        let available = (widths[column] - CELL_INSET).max(8.0);
+        let single = text_width(&cell.text, style.size);
+        if single > available && single <= available * 2.0 {
+            // Half a pixel of slack: adding the inset and taking it off again
+            // is not exact in floating point, and a cell that lands exactly on
+            // the width must not be wrapped for a rounding error. The clearance
+            // is what keeps the last digit of a phone number off the border.
+            widths[column] = widths[column].max(single + CELL_INSET + CELL_CLEARANCE + 0.5);
+        }
     }
 
     let mut column_lefts = Vec::with_capacity(columns + 1);
     let mut left = 0.0;
     column_lefts.push(0.0);
-    for column in 0..columns {
-        let width = data
-            .column_widths
-            .get(&(column as u32))
-            .copied()
-            .unwrap_or(data.default_column_width);
-        left += width.max(8.0);
+    for width in &widths {
+        left += *width;
         column_lefts.push(left);
+    }
+
+    // Each cell is marked with the wrapping it needs, and every row starts at
+    // the height the sheet gave it. A row that was sized for one line but now
+    // carries a wrapped cell grows to fit: the reader would rather show a
+    // taller row than the top half of a name.
+    let mut heights = (0..rows)
+        .map(|row| {
+            data.row_heights
+                .get(&(row as u32))
+                .copied()
+                .unwrap_or(data.default_row_height)
+                .max(6.0)
+        })
+        .collect::<Vec<_>>();
+    let mut required = vec![0.0f32; rows];
+    let mut merged_growth = Vec::new();
+    let merges = &data.merges;
+
+    for cell in &mut data.cells {
+        if cell.text.is_empty() {
+            continue;
+        }
+        let Some(style) = styles.get(cell.style) else {
+            continue;
+        };
+        let span = merged_span(merges, cell.row, cell.column);
+        let start = (cell.column as usize).min(columns);
+        let end = (start + span.1 as usize).min(columns);
+        let available = (column_lefts[end] - column_lefts[start] - CELL_INSET).max(8.0);
+
+        // A line break is a break whether the style asks for wrapping or not,
+        // and text that does not fit on one line is wrapped instead of being
+        // clipped. Only a cell that is both short enough and break-free keeps
+        // Excel's single-line look.
+        let wrap = style.wrap
+            || cell.text.contains('\n')
+            || text_width(&cell.text, style.size) > available + 0.5;
+        cell.wrap = wrap;
+        if !wrap {
+            continue;
+        }
+
+        let lines = wrapped_lines(&cell.text, style.size, available);
+        let needed = lines as f32 * style.size * LINE_HEIGHT_FACTOR + CELL_VPAD;
+        if span.0 <= 1 {
+            let row = (cell.row as usize).min(rows - 1);
+            required[row] = required[row].max(needed);
+        } else {
+            merged_growth.push((cell.row, span.0, needed));
+        }
+    }
+
+    for (height, needed) in heights.iter_mut().zip(required.iter()) {
+        *height = height.max(*needed);
+    }
+    // A merged cell that needs more room than its rows have pushes the bottom
+    // row down. Growing only the last row keeps the rows above it exactly
+    // where Excel put them.
+    for (row, span, needed) in merged_growth {
+        let start = (row as usize).min(rows - 1);
+        let end = (start + span as usize).min(rows);
+        if end <= start {
+            continue;
+        }
+        let current: f32 = heights[start..end].iter().sum();
+        if current + 0.5 < needed {
+            heights[end - 1] += needed - current;
+        }
     }
 
     let mut row_tops = Vec::with_capacity(rows + 1);
     let mut top = 0.0;
     row_tops.push(0.0);
-    for row in 0..rows {
-        let height = data
-            .row_heights
-            .get(&(row as u32))
-            .copied()
-            .unwrap_or(data.default_row_height);
-        top += height.max(6.0);
+    for height in &heights {
+        top += *height;
         row_tops.push(top);
     }
 
@@ -663,26 +841,24 @@ fn finish_sheet(mut data: SheetData, styles: &[CellStyle]) -> Sheet {
             style,
             text,
             numeric,
+            wrap,
         } = cell;
+        let cell = Cell {
+            column,
+            text,
+            style,
+            numeric,
+            wrap,
+        };
         if current_row == Some(row) {
             if let Some(last) = grouped.last_mut() {
-                last.cells.push(Cell {
-                    column,
-                    text,
-                    style,
-                    numeric,
-                });
+                last.cells.push(cell);
             }
         } else {
             current_row = Some(row);
             grouped.push(SheetRow {
                 index: row,
-                cells: vec![Cell {
-                    column,
-                    text,
-                    style,
-                    numeric,
-                }],
+                cells: vec![cell],
             });
         }
     }
@@ -696,26 +872,90 @@ fn finish_sheet(mut data: SheetData, styles: &[CellStyle]) -> Sheet {
     }
 }
 
-/// Rough line count of `text` at `size` pixels in a column `width` pixels wide.
-fn estimated_lines(text: &str, size: f32, width: f32) -> usize {
+/// True for a value that should stay on one line if a column is only a little
+/// too narrow: a short run of plain ASCII such as `18729575026`, or a short
+/// Chinese label such as `是否有异常`. A long sentence still wraps rather than
+/// widening its column.
+fn is_unbreakable(text: &str) -> bool {
+    let count = text.chars().count();
+    if text.is_ascii() {
+        count <= 20
+    } else {
+        count <= 8
+    }
+}
+
+/// Width of `text` drawn on one line, in logical pixels.
+fn text_width(text: &str, size: f32) -> f32 {
+    text.chars()
+        .map(|character| char_advance(character, size))
+        .sum()
+}
+
+/// Advance width of one character, in logical pixels.
+///
+/// The em is rounded up to a whole pixel because neither renderer draws at the
+/// exact fractional size: GDI creates its font at `round(pt * dpi / 72)` and a
+/// 11 pt cell is therefore a 15 px font on a 96 dpi page, every glyph a
+/// fraction wider than the point size suggests. Estimating without that
+/// rounding left a phone number 2 px narrower than it is drawn, and the last
+/// digit was clipped by the cell it sat in.
+///
+/// Inside the em a CJK glyph is a full em wide; ASCII in the fonts Excel uses
+/// runs about six tenths of an em — `18729575026` measures 99 px at 15 px, not
+/// the 91 px a five-tenths estimate gives.
+fn char_advance(character: char, size: f32) -> f32 {
+    let em = size.ceil();
+    match character {
+        // A tab is a column stop rather than a glyph; two ems is a fair guess
+        // and errs on the wide side, which only ever adds slack.
+        '\t' => em * 2.0,
+        // Line breaks take no room on the line they end.
+        '\n' | '\r' => 0.0,
+        _ if character.is_ascii() => em * 0.6,
+        _ => em,
+    }
+}
+
+/// The number of lines `text` takes when drawn `width` pixels wide.
+///
+/// Each hard line break starts a new line, and a line that runs past `width`
+/// wraps. The estimate counts every character, so it never comes out below the
+/// renderer's word-aware wrapping — the row is a touch too tall rather than a
+/// line short.
+fn wrapped_lines(text: &str, size: f32, width: f32) -> usize {
+    let width = width.max(1.0);
+    let mut lines = 0usize;
+    for line in text.split('\n') {
+        lines += wrapped_lines_of(line, size, width);
+    }
+    lines.max(1).min(MAX_WRAP_LINES)
+}
+
+/// Lines one hard line of text takes at `width`.
+fn wrapped_lines_of(line: &str, size: f32, width: f32) -> usize {
     let mut lines = 1usize;
     let mut used = 0.0;
-    for character in text.chars() {
-        let advance = if character.is_ascii() {
-            size * 0.55
-        } else {
-            size
-        };
-        if used + advance > width {
+    for character in line.chars() {
+        let advance = char_advance(character, size);
+        // A single glyph wider than the column still has to go somewhere; it
+        // gets its own line instead of wrapping to an empty one forever.
+        if used > 0.0 && used + advance > width {
             lines += 1;
             used = 0.0;
         }
         used += advance;
-        if lines >= 20 {
-            break;
-        }
     }
     lines
+}
+
+/// Row and column span of the merge anchored at `(row, column)`, or `(1, 1)`.
+fn merged_span(merges: &[Merge], row: u32, column: u32) -> (u32, u32) {
+    merges
+        .iter()
+        .find(|merge| merge.row == row && merge.column == column)
+        .map(|merge| (merge.rows, merge.columns))
+        .unwrap_or((1, 1))
 }
 
 fn parse_merge(reference: &str) -> Option<Merge> {
@@ -728,8 +968,8 @@ fn parse_merge(reference: &str) -> Option<Merge> {
     Some(Merge {
         row,
         column,
-        rows: end_row - row + 1,
-        columns: end_column - column + 1,
+        rows: (end_row - row + 1).min(MAX_SHEET_ROWS),
+        columns: (end_column - column + 1).min(MAX_SHEET_COLUMNS),
     })
 }
 
@@ -757,7 +997,10 @@ fn cell_reference(reference: &str) -> Option<(u32, u32)> {
         return None;
     }
     let row = row.parse::<u32>().ok()?.saturating_sub(1);
-    Some((row, column.saturating_sub(1)))
+    Some((
+        row.min(MAX_SHEET_ROWS - 1),
+        column.saturating_sub(1).min(MAX_SHEET_COLUMNS - 1),
+    ))
 }
 
 fn shared_strings(xml: &str) -> Vec<String> {
@@ -778,6 +1021,14 @@ fn shared_strings(xml: &str) -> Vec<String> {
                     && let Some(text) = current.as_mut()
                 {
                     text.push_str(&text_of(&event));
+                }
+            }
+            Ok(Event::GeneralRef(event)) => {
+                if phonetic_depth == 0
+                    && let Some(text) = current.as_mut()
+                    && let Some(reference) = ooxml::text_of_ref(&event)
+                {
+                    text.push_str(&reference);
                 }
             }
             Ok(Event::End(event)) => match end_name(&event) {
@@ -852,11 +1103,14 @@ fn theme_of(xml: Option<String>) -> Theme {
         };
         // `srgbClr` carries the colour itself; `sysClr` names a system colour
         // and keeps the one it stood for in `lastClr`.
-        let value = entry.children.iter().find_map(|color| match color.name.as_str() {
-            "srgbClr" => color.attr("val"),
-            "sysClr" => color.attr("lastClr"),
-            _ => None,
-        });
+        let value = entry
+            .children
+            .iter()
+            .find_map(|color| match color.name.as_str() {
+                "srgbClr" => color.attr("val"),
+                "sysClr" => color.attr("lastClr"),
+                _ => None,
+            });
         if let Some(color) = value.and_then(|value| parse_hex_color(&value)) {
             theme.colors[slot] = color;
         }
@@ -1154,9 +1408,11 @@ fn fill_of(node: &Node, theme: &Theme) -> Option<u32> {
         }
         // A solid fill names its colour in `fgColor`, but some writers put it
         // in `bgColor` and leave the first one out.
-        return ["fgColor", "bgColor"]
-            .into_iter()
-            .find_map(|name| pattern.child(name).and_then(|color| resolve_color(color, theme)));
+        return ["fgColor", "bgColor"].into_iter().find_map(|name| {
+            pattern
+                .child(name)
+                .and_then(|color| resolve_color(color, theme))
+        });
     }
 
     // A gradient is painted with its first stop, which is close enough to the
@@ -1775,7 +2031,10 @@ mod tests {
         let empty = sheet.cell(0, 0).expect("the shaded empty cell is kept");
         assert_eq!(empty.text, "", "it still holds no text");
         assert_eq!(empty.style, 1);
-        assert_eq!(sheet.cell(0, 1).map(|cell| cell.text.as_str()), Some("标题"));
+        assert_eq!(
+            sheet.cell(0, 1).map(|cell| cell.text.as_str()),
+            Some("标题")
+        );
         // A cell with nothing to show and nothing to paint stays out of the model.
         assert_eq!(sheet.row_count(), 2);
         assert_eq!(sheet.column_count(), 2);
@@ -1783,10 +2042,248 @@ mod tests {
 
     #[test]
     fn a_gradient_fill_takes_its_first_stop() {
-        let fill = root(r#"<fill><gradientFill type="linear">
+        let fill = root(
+            r#"<fill><gradientFill type="linear">
             <stop position="0"><color indexed="6"/></stop>
             <stop position="1"><color indexed="4"/></stop>
-        </gradientFill></fill>"#);
+        </gradientFill></fill>"#,
+        );
         assert_eq!(fill_of(&fill, &Theme::fallback()), Some(0xFF00FF));
+    }
+
+    /// OOXML allows `<c>` without an `r` attribute. The fallback used to swap
+    /// row and column, silently transposing the whole sheet.
+    #[test]
+    fn cells_without_a_reference_keep_their_row_and_column() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="2"><c t="inlineStr"><is><t>甲</t></is></c><c t="inlineStr"><is><t>乙</t></is></c></row>
+            <row r="3"><c t="inlineStr"><is><t>丙</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert_eq!(cell_reference("B12"), Some((11, 1)));
+        assert_eq!(sheet.cell(1, 0).map(|cell| cell.text.as_str()), Some("甲"));
+        assert_eq!(sheet.cell(1, 1).map(|cell| cell.text.as_str()), Some("乙"));
+        assert_eq!(sheet.cell(2, 0).map(|cell| cell.text.as_str()), Some("丙"));
+    }
+
+    /// A few bytes of XML must not be able to make the layout allocate
+    /// gigabytes for `column_lefts` or loop billions of times.
+    #[test]
+    fn a_huge_cell_reference_cannot_inflate_the_sheet() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="AAAAAAAA1" t="inlineStr"><is><t>x</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert!(sheet.row_count() <= MAX_SHEET_ROWS as usize);
+        assert!(sheet.column_count() <= MAX_SHEET_COLUMNS as usize);
+        assert_eq!(
+            sheet
+                .cell(0, MAX_SHEET_COLUMNS - 1)
+                .map(|cell| cell.text.as_str()),
+            Some("x"),
+            "越界引用被夹回合法的最后一列"
+        );
+    }
+
+    // ------------------------------------------------------- fitting the text
+
+    /// A sentence far wider than the column wraps instead of stretching it,
+    /// and the row grows to hold every line.
+    #[test]
+    fn text_wider_than_its_column_wraps_and_grows_the_row() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>一二三四五六七八九十</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert!(sheet.cell(0, 0).expect("cell").wrap, "十个汉字要折行");
+        assert!(
+            sheet.row_tops[1] >= DEFAULT_FONT_SIZE * LINE_HEIGHT_FACTOR * 2.0,
+            "折行后行高要留出多行"
+        );
+        assert!(
+            (sheet.column_lefts[1] - DEFAULT_COLUMN_WIDTH * 7.0 - 5.0).abs() < 0.01,
+            "这么长的文本不该把列撑宽"
+        );
+    }
+
+    #[test]
+    fn a_short_cell_keeps_excels_single_line() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>甲</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert!(!sheet.cell(0, 0).expect("cell").wrap);
+        assert!(
+            (sheet.row_tops[1] - DEFAULT_ROW_HEIGHT * 4.0 / 3.0).abs() < 0.01,
+            "放得下的单行不该被动过"
+        );
+    }
+
+    /// Excel writes a height for nearly every row. Keeping it as-is is how the
+    /// text ended up taller than its cell and got cut in half.
+    #[test]
+    fn a_wrapped_cell_overrides_a_row_height_that_is_too_short() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1" ht="10" customHeight="1"><c r="A1" s="0" t="inlineStr"><is><t>一二三四五六七八</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        // ht=10pt is 13.3px, while eight characters need three lines.
+        assert!(sheet.row_tops[1] > 13.4, "内容比固定行高高，行要跟着长");
+    }
+
+    /// A line break is a line even when the style does not ask for wrapping.
+    #[test]
+    fn a_manual_line_break_wraps_and_counts_as_two_lines() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>甲&#10;乙</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+        let cell = sheet.cell(0, 0).expect("cell");
+
+        assert_eq!(cell.text, "甲\n乙", "换行符留在了文本里");
+        assert!(cell.wrap, "有换行就得按两行画");
+        assert!(sheet.row_tops[1] >= DEFAULT_FONT_SIZE * LINE_HEIGHT_FACTOR * 2.0);
+    }
+
+    /// A merge widens the cell, so text that would wrap in one column fits on
+    /// one line once two columns are joined.
+    #[test]
+    fn a_merged_cell_wraps_to_its_whole_width() {
+        let wrap_of = |merges: &str| {
+            let xml = format!(
+                r#"<worksheet><sheetData>
+                    <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>一二三四五六七八</t></is></c></row>
+                </sheetData>{merges}</worksheet>"#
+            );
+            parse_sheet("表一", &xml, &[], &styles(), false)
+                .cell(0, 0)
+                .expect("cell")
+                .wrap
+        };
+
+        assert!(wrap_of(""), "一列装不下八个汉字");
+        assert!(
+            !wrap_of(r#"<mergeCells><mergeCell ref="A1:B1"/></mergeCells>"#),
+            "两列合起来就装得下"
+        );
+    }
+
+    /// The rows a merge spans may still be shorter than its text; the extra
+    /// height goes to the bottom row so the rows above it stay where they were.
+    #[test]
+    fn a_tall_merged_cell_grows_the_last_row_it_covers() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>一二三四五六七八九十</t></is></c></row>
+            <row r="2"/>
+        </sheetData><mergeCells><mergeCell ref="A1:A2"/></mergeCells></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert_eq!(sheet.row_count(), 2);
+        let first = sheet.row_tops[1] - sheet.row_tops[0];
+        let total = sheet.row_tops[2] - sheet.row_tops[0];
+        assert!(
+            (first - DEFAULT_ROW_HEIGHT * 4.0 / 3.0).abs() < 0.01,
+            "第一行保持原高"
+        );
+        assert!(total > 2.0 * DEFAULT_ROW_HEIGHT * 4.0 / 3.0, "合并区被撑高");
+    }
+
+    /// A phone number has no break point, so a column that is just too narrow
+    /// grows instead of splitting the number across two lines.
+    #[test]
+    fn a_narrow_column_grows_for_a_phone_number() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>18729575026</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+        let cell = sheet.cell(0, 0).expect("cell");
+
+        assert!(!cell.wrap, "电话号码不折行");
+        let width = sheet.column_lefts[1] - sheet.column_lefts[0];
+        assert!(
+            width > DEFAULT_COLUMN_WIDTH * 7.0 + 5.0,
+            "默认列宽放不下，列要加宽"
+        );
+        assert!(
+            width >= text_width(&cell.text, DEFAULT_FONT_SIZE) + CELL_INSET + CELL_CLEARANCE - 0.01,
+            "加宽后还要留出框内空白，数字不会贴着边框"
+        );
+    }
+
+    /// A short Chinese label that misses its column by a few pixels gets a
+    /// wider column too: `是否有异常` split after four characters reads as two
+    /// unrelated words.
+    #[test]
+    fn a_short_chinese_label_keeps_one_line_by_widening_its_column() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>是否有异常</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert!(!sheet.cell(0, 0).expect("cell").wrap, "五个字不该折行");
+        assert!(
+            sheet.column_lefts[1] > DEFAULT_COLUMN_WIDTH * 7.0 + 5.0,
+            "列被放宽到装得下"
+        );
+    }
+
+    /// Growing a column has a limit: a run much wider than the column wraps,
+    /// or one long value would stretch the whole sheet sideways.
+    #[test]
+    fn a_long_run_without_breaks_wraps_instead_of_stretching_the_column() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" s="0" t="inlineStr"><is><t>ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let sheet = parse_sheet("表一", xml, &[], &styles(), false);
+
+        assert!(sheet.cell(0, 0).expect("cell").wrap, "过长的串改为折行");
+        assert!(
+            (sheet.column_lefts[1] - DEFAULT_COLUMN_WIDTH * 7.0 - 5.0).abs() < 0.01,
+            "列宽保持原样"
+        );
+    }
+
+    /// quick-xml hands `&#10;` over as a general reference rather than text, and
+    /// the shared-string reader used to drop it — every Alt+Enter line break in
+    /// a cell was lost before the cell ever reached the layout.
+    #[test]
+    fn a_shared_string_keeps_its_line_break_and_entities() {
+        let xml = r#"<sst><si><t>甲&#10;乙 &amp; 丙</t></si></sst>"#;
+        assert_eq!(shared_strings(xml), vec![String::from("甲\n乙 & 丙")]);
+    }
+
+    #[test]
+    fn wrapped_lines_counts_hard_breaks_and_overlong_lines() {
+        assert_eq!(wrapped_lines("甲乙", 15.0, 100.0), 1);
+        assert_eq!(wrapped_lines("甲\n乙\n丙", 15.0, 100.0), 3);
+        // Six characters fit in a hundred pixels; the seventh wraps.
+        assert_eq!(wrapped_lines("一二三四五六七", 15.0, 100.0), 2);
+        assert_eq!(wrapped_lines("", 15.0, 100.0), 1);
+    }
+
+    #[test]
+    fn a_glyph_wider_than_the_column_gets_its_own_line() {
+        assert_eq!(wrapped_lines("甲乙丙", 15.0, 1.0), 3);
+    }
+
+    #[test]
+    fn a_cjk_glyph_is_a_full_em_and_ascii_is_narrower() {
+        assert!((text_width("中", 10.0) - 10.0).abs() < 0.01);
+        assert!((text_width("a", 10.0) - 6.0).abs() < 0.01);
+    }
+
+    /// GDI rounds the font up to whole pixels, so 11 pt cells are drawn with a
+    /// 15 px font. The estimate has to do the same or the drawn text is wider
+    /// than the column it was measured against.
+    #[test]
+    fn the_estimate_uses_the_whole_pixel_font_height() {
+        let eleven_pt = DEFAULT_FONT_SIZE; // 14.67 px
+        assert!((text_width("中", eleven_pt) - 15.0).abs() < 0.01);
+        assert!((text_width("18729575026", eleven_pt) - 99.0).abs() < 0.01);
     }
 }

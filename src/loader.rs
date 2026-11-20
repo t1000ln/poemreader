@@ -16,9 +16,10 @@ use crate::picture::{self, Picture};
 use crate::word::{self, WordDocument};
 use crate::xls;
 
-/// PDFs, Office documents, Markdown and pictures are decoded and held in
-/// memory as a whole, so they keep a size cap. Text files are wrapped into rows
-/// while being read and have no size limit.
+/// Every document is read into memory as a whole — text files included, since
+/// they are decoded and wrapped after the read — so all of them share one cap.
+/// Without it a large stray file (or an unknown extension) could make the
+/// process allocate gigabytes before it even knows what it opened.
 const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,9 +102,10 @@ fn load_office(bytes: Vec<u8>) -> Result<(DocumentKind, LoadedContent), String> 
 
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("无法读取文件信息：{error}"))?;
-    if (is_pdf_path(path) || is_office_path(path) || is_markdown_path(path) || is_image_path(path))
-        && metadata.len() > MAX_DOCUMENT_BYTES
-    {
+    // Applies to every extension: unknown suffixes fall through to the text
+    // and image probes, and those are the ones that used to read a whole file
+    // with no limit at all.
+    if metadata.len() > MAX_DOCUMENT_BYTES {
         return Err(format!(
             "文件过大（{:.1} MB），最大支持 {} MB",
             metadata.len() as f64 / (1024.0 * 1024.0),
@@ -116,13 +118,6 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
 
 fn is_pdf_path(path: &Path) -> bool {
     has_extension(path, &["pdf"])
-}
-
-fn is_office_path(path: &Path) -> bool {
-    has_extension(
-        path,
-        &["docx", "xlsx", "docm", "xlsm", "dotx", "xltx", "doc", "xls"],
-    )
 }
 
 fn is_markdown_path(path: &Path) -> bool {

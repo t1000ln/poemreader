@@ -85,11 +85,15 @@ pub(crate) struct CellSelection {
 
 impl CellSelection {
     pub(crate) fn ordered(&self) -> ((u32, u32), (u32, u32)) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
+        // Compare the two axes separately: tuple ordering would only swap
+        // when both row and column go backwards, so a drag up-and-left (or
+        // down-and-right) left `left > right` and selected nothing.
+        let (anchor_row, anchor_column) = self.anchor;
+        let (head_row, head_column) = self.head;
+        (
+            (anchor_row.min(head_row), anchor_column.min(head_column)),
+            (anchor_row.max(head_row), anchor_column.max(head_column)),
+        )
     }
 
     pub(crate) fn contains(&self, row: u32, column: u32) -> bool {
@@ -206,6 +210,9 @@ impl PoemReader {
         if event.pressed_button != Some(MouseButton::Left) {
             // The release happened outside the window, or the drag was cancelled.
             self.interaction = None;
+            // The cursor follows `interaction`; without a repaint it would
+            // stay a closed hand until something else changed on screen.
+            cx.notify();
             return;
         }
 
@@ -334,4 +341,33 @@ fn build_reading_menu(
                 });
             }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CellSelection;
+
+    fn selection(anchor: (u32, u32), head: (u32, u32)) -> CellSelection {
+        CellSelection { anchor, head }
+    }
+
+    /// Dragging up-and-left used to leave `left > right` because the two
+    /// points were compared as tuples instead of axis by axis.
+    #[test]
+    fn a_selection_dragged_up_and_left_still_covers_its_cells() {
+        let selection = selection((0, 5), (3, 2));
+        assert_eq!(selection.ordered(), ((0, 2), (3, 5)));
+        assert!(selection.contains(1, 3));
+        assert!(selection.contains(0, 5), "the anchor corner is inside");
+        assert!(!selection.contains(4, 3), "outside the row range");
+        assert!(!selection.contains(1, 6), "outside the column range");
+    }
+
+    #[test]
+    fn a_selection_dragged_down_and_right_is_unchanged() {
+        let selection = selection((1, 1), (4, 6));
+        assert_eq!(selection.ordered(), ((1, 1), (4, 6)));
+        assert!(selection.contains(4, 6));
+        assert!(!selection.contains(0, 0));
+    }
 }

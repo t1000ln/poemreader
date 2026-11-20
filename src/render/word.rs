@@ -15,6 +15,11 @@ use super::{LinePlace, LineText, SelectableLine};
 use crate::events::Selection;
 use crate::word;
 
+/// Word's default left and right cell padding: 0.19 cm, which is 5.4 pt. The
+/// text of a cell therefore starts that far inside the cell's edge, and the
+/// room left for it decides where a cell's text wraps.
+const CELL_PADDING_PT: f32 = 5.4;
+
 // ---------------------------------------------------------------- Word layout
 
 /// How a text block takes its width inside its line.
@@ -685,6 +690,11 @@ pub(crate) fn trim_trailing_whitespace(text: &mut String, runs: &mut Vec<TextRun
 fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
     let scale = render.scale;
     let border = render.foreground.opacity(0.35);
+    // Word pads a cell with 5.4 pt on each side. The border is drawn on the
+    // cell's edge and eats one pixel of that padding, so the text keeps the
+    // room Word gives it instead of losing two more pixels per cell.
+    let padding = (CELL_PADDING_PT * scale).max(2.0);
+    let inset = (padding - 1.0).max(1.0);
     // Rough heights of every row, in points, so the contents of a merged
     // cell can be centred across all the rows it spans.
     let row_heights = estimated_row_heights(table, scale);
@@ -703,7 +713,8 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
                 .sum::<f32>()
                 .max(24.0);
             // Points of room the text has inside the cell's side padding.
-            let width_pt = (width - 14.0) / scale;
+            let width_pt = (width - 2.0 * padding) / scale;
+            let content_width = cell_text_width(width, scale);
             let start = column;
             column += span;
 
@@ -735,7 +746,7 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
                 remaining.insert(start, cell.row_span - 1);
             }
 
-            let mut element = div().flex_shrink_0().w(px(width)).px(px(7.));
+            let mut element = div().flex_shrink_0().w(px(width)).px(px(inset));
             if let Some(fill) = cell.fill {
                 element = element.bg(rgb(fill));
             }
@@ -777,7 +788,7 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
                 // A spacer in the flow would stretch the first spanned row to
                 // half the merged area, so the centred content sits absolutely
                 // on top of the covered rows instead.
-                let mut content = v_flex().w_full();
+                let mut content = v_flex().w(px(content_width));
                 for block in &cell.blocks {
                     content = content.child(word_block(block, render, Some(row_id)));
                 }
@@ -787,8 +798,8 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
                         div()
                             .absolute()
                             .top(px(spacer * scale))
-                            .left(px(7.))
-                            .right(px(7.))
+                            .left(px(inset))
+                            .w(px(content_width))
                             .child(content),
                     );
             } else {
@@ -799,7 +810,7 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
                 for block in &cell.blocks {
                     blocks.push(word_block(block, render, Some(row_id)));
                 }
-                element = element.child(v_flex().w_full().children(blocks));
+                element = element.child(v_flex().w(px(content_width)).children(blocks));
             }
             cells.push(element.into_any_element());
         }
@@ -826,12 +837,25 @@ fn word_table(table: &word::Table, render: &mut WordRender) -> AnyElement {
     .into_any_element()
 }
 
+/// Width, in pixels, that a table cell's text may occupy.
+///
+/// Word pads a cell with 5.4 pt on each side, and it breaks a line only when
+/// the next character would *start* past the cell's edge — so the last glyph
+/// of a line may hang into the right padding. gpui instead breaks as soon as
+/// the glyphs pass the width, which costs a full cell one character per line.
+/// Handing the text block the right padding as slack restores Word's breaks;
+/// the slack never reaches the border, so nothing is drawn over it.
+fn cell_text_width(width: f32, scale: f32) -> f32 {
+    let padding = (CELL_PADDING_PT * scale).max(2.0);
+    (width - padding).max(24.0)
+}
+
 /// Rough height of every table row in points: the tallest cell's contents,
 /// or the stored minimum height, whichever is larger.
 pub(crate) fn estimated_row_heights(table: &word::Table, scale: f32) -> Vec<f32> {
-    // Cells carry 7 px of side padding, which is only 7/scale points: at a
-    // zoomed-in scale the padding must not eat into the text column twice.
-    let padding = 14.0 / scale.max(0.1);
+    // Cells are padded 5.4 pt on each side; the estimate works in points, so
+    // the rendered padding is scaled back into points here.
+    let padding = 2.0 * (CELL_PADDING_PT * scale).max(2.0) / scale.max(0.1);
     table
         .rows
         .iter()
@@ -923,5 +947,45 @@ pub(crate) fn merged_spacer(cell: &word::TableCell, spanned_heights: &[f32], wid
         word::VAlign::Top => 0.0,
         word::VAlign::Center => free / 2.0,
         word::VAlign::Bottom => free,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cell_text_width, CELL_PADDING_PT};
+
+    /// The zoom used by the screenshots this layout was checked against.
+    const SCALE: f32 = 1.1526;
+
+    /// A cell must keep Word's 5.4 pt side padding. With the old fixed 7 px
+    /// padding the text lost about 2 pt, and a line of four 12 pt characters —
+    /// 「基本情况」in a form's first column — wrapped where Word keeps it whole.
+    #[test]
+    fn a_cell_leaves_word_s_side_padding_for_its_text() {
+        let width = 60.45 * SCALE;
+        let padding = (CELL_PADDING_PT * SCALE).max(2.0);
+        let text = width - 2.0 * padding;
+
+        // 60.45 pt wide cell, 5.4 pt of padding on each side, like Word.
+        assert!((text - (60.45 - 10.8) * SCALE).abs() < 0.01);
+        // Four 12 pt characters fit in the room that is left.
+        assert!(4.0 * 12.0 * SCALE <= text + 0.01);
+    }
+
+    /// The slack a line may hang into must stay inside the padding: the text
+    /// may reach the border but never cross it.
+    #[test]
+    fn the_hanging_glyph_stays_inside_the_padding() {
+        let padding = (CELL_PADDING_PT * SCALE).max(2.0);
+        for width in [40.0_f32, 60.45 * SCALE, 200.0] {
+            let overhang = cell_text_width(width, SCALE) - (width - 2.0 * padding);
+            assert!(overhang > 0.0 && overhang <= padding + 0.01);
+        }
+    }
+
+    /// A cell narrower than its own padding keeps a usable text width.
+    #[test]
+    fn a_tiny_cell_keeps_a_text_width() {
+        assert!(cell_text_width(4.0, SCALE) >= 24.0);
     }
 }
